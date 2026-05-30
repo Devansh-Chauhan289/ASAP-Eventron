@@ -1,0 +1,605 @@
+// ASAP — canonical Prisma schema. PostgreSQL is the system of record; Prisma is the only ORM.
+// See docs/architecture/08-prisma-postgres.md for the full reasoning behind every model & index.
+// NOTE: geography is modelled as lat/lng floats (not PostGIS) so the schema runs on vanilla Postgres in dev.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["multiSchema"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  schemas  = ["identity", "trip", "booking", "payment", "notify", "provider", "platform"]
+}
+
+// ============================ ENUMS ============================
+enum TripStatus {
+  DRAFT
+  PLANNING
+  PENDING_PAYMENT
+  PAYMENT_FAILED
+  BOOKING
+  CONFIRMED
+  PARTIALLY_BOOKED
+  COMPENSATING
+  CANCELLATION_REQUESTED
+  CANCELLED
+  COMPLETED
+  NEEDS_ATTENTION
+
+  @@schema("trip")
+}
+
+enum LegType {
+  EVENT
+  TRANSPORT
+  STAY
+
+  @@schema("trip")
+}
+
+enum SagaStep {
+  AUTHORIZE_PAYMENT
+  RESERVE_EVENT
+  RESERVE_TRANSPORT
+  RESERVE_STAY
+  CAPTURE_PAYMENT
+  CONFIRM_LEGS
+  COMPENSATE
+  DONE
+
+  @@schema("trip")
+}
+
+enum BookingStatus {
+  PENDING
+  RESERVED
+  RETRYING
+  CONFIRMED
+  RELEASING
+  RELEASED
+  CANCELLING
+  CANCELLED
+  EXPIRED
+  REJECTED
+  FAILED
+  FULFILLED
+
+  @@schema("booking")
+}
+
+enum TransportMode {
+  FLIGHT
+  TRAIN
+  BUS
+  RIDESHARE
+
+  @@schema("booking")
+}
+
+enum PaymentStatus {
+  CREATED
+  REQUIRES_PAYMENT_METHOD
+  REQUIRES_CONFIRMATION
+  REQUIRES_ACTION
+  PROCESSING
+  AUTHORIZED
+  CAPTURED
+  VOIDED
+  FAILED
+  PARTIALLY_REFUNDED
+  REFUNDED
+  DISPUTED
+  CHARGEBACK
+
+  @@schema("payment")
+}
+
+enum RefundStatus {
+  REQUESTED
+  APPROVED
+  DENIED
+  AWAITING_PROVIDER
+  PROCESSING
+  SUCCEEDED
+  RETRYING
+  FAILED_NEEDS_ATTENTION
+
+  @@schema("payment")
+}
+
+enum LedgerDirection {
+  DEBIT
+  CREDIT
+
+  @@schema("payment")
+}
+
+enum NotificationStatus {
+  QUEUED
+  SENDING
+  SENT
+  DELIVERED
+  RETRYING
+  FAILED
+  UNCONFIRMED
+
+  @@schema("notify")
+}
+
+enum NotificationChannel {
+  PUSH
+  EMAIL
+
+  @@schema("notify")
+}
+
+enum ProviderName {
+  TICKETMASTER
+  EVENTBRITE
+  AMADEUS
+  RAIL_AGG
+  BUS_AGG
+  BOOKING_COM
+  UBER
+  STRIPE
+
+  @@schema("provider")
+}
+
+enum OutboxStatus {
+  PENDING
+  DISPATCHED
+  FAILED
+
+  @@schema("platform")
+}
+
+// ============================ IDENTITY ============================
+model User {
+  id           String        @id @default(uuid()) @db.Uuid
+  email        String        @unique
+  phone        String?       @unique
+  displayName  String
+  status       String        @default("ACTIVE") // ACTIVE | DEACTIVATED
+  role         String        @default("USER") // USER | OPS | ADMIN
+  credential   Credential?
+  sessions     Session[]
+  deviceTokens DeviceToken[]
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  @@index([status, createdAt])
+  @@schema("identity")
+}
+
+model Credential {
+  userId       String   @id @db.Uuid
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  passwordHash String // argon2id
+  updatedAt    DateTime @updatedAt
+
+  @@schema("identity")
+}
+
+model Session {
+  id          String    @id @default(uuid()) @db.Uuid
+  userId      String    @db.Uuid
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshHash String // hashed rotating refresh token
+  userAgent   String?
+  ip          String?
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([userId, expiresAt])
+  @@schema("identity")
+}
+
+model DeviceToken {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String   @db.Uuid
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token      String   @unique // FCM token
+  platform   String // IOS | ANDROID | WEB
+  lastSeenAt DateTime @default(now())
+
+  @@index([userId])
+  @@schema("identity")
+}
+
+// ============================ TRIP ORCHESTRATION ============================
+model Trip {
+  id               String     @id @default(uuid()) @db.Uuid
+  userId           String     @db.Uuid // logical ref -> identity.User
+  status           TripStatus @default(DRAFT)
+  currency         String     @default("USD") @db.Char(3)
+  // anchor
+  anchorLegId      String?    @db.Uuid
+  destinationCity  String?
+  destinationLat   Float?
+  destinationLng   Float?
+  arriveBy         DateTime?
+  departAfter      DateTime?
+  startsAt         DateTime?
+  endsAt           DateTime?
+  // money totals (minor units)
+  authorizedAmount BigInt     @default(0)
+  capturedAmount   BigInt     @default(0)
+  refundedAmount   BigInt     @default(0)
+  paymentIntentId  String?    @db.Uuid // logical ref -> payment.PaymentIntent
+  version          Int        @default(0) // optimistic lock
+  legs             TripLeg[]
+  saga             SagaState?
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([status, updatedAt]) // saga poller (partial index added in migration)
+  @@schema("trip")
+}
+
+model TripLeg {
+  id            String        @id @default(uuid()) @db.Uuid
+  tripId        String        @db.Uuid
+  trip          Trip          @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  type          LegType
+  sequence      Int
+  status        BookingStatus @default(PENDING) // denormalized projection
+  bookingId     String?       @db.Uuid // logical ref -> owning booking aggregate
+  providerRef   String?
+  priceAmount   BigInt        @default(0)
+  priceCurrency String        @default("USD") @db.Char(3)
+  compRequired  Boolean       @default(false)
+  refundId      String?       @db.Uuid
+  cancelledAt   DateTime?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  @@unique([tripId, sequence])
+  @@index([tripId])
+  @@index([bookingId])
+  @@schema("trip")
+}
+
+model SagaState {
+  tripId       String    @id @db.Uuid
+  trip         Trip      @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  step         SagaStep  @default(AUTHORIZE_PAYMENT)
+  compensating Boolean   @default(false)
+  attempts     Int       @default(0)
+  lastError    String?
+  nextRunAt    DateTime?
+  updatedAt    DateTime  @updatedAt
+
+  @@index([step, nextRunAt])
+  @@schema("trip")
+}
+
+// ============================ BOOKING ============================
+model EventBooking {
+  id              String        @id @default(uuid()) @db.Uuid
+  tripId          String        @db.Uuid
+  tripLegId       String        @unique @db.Uuid // INV-B3 dedupe
+  userId          String        @db.Uuid
+  provider        ProviderName
+  externalEventId String
+  status          BookingStatus @default(PENDING)
+  providerRef     String? // confirmation ref (INV-B1)
+  holdExpiresAt   DateTime?
+  priceAmount     BigInt
+  priceCurrency   String        @db.Char(3)
+  idempotencyKey  String        @unique
+  version         Int           @default(0)
+  attributes      Json
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@index([tripId])
+  @@index([status, updatedAt])
+  @@index([userId, createdAt(sort: Desc)])
+  @@schema("booking")
+}
+
+model TransportBooking {
+  id             String        @id @default(uuid()) @db.Uuid
+  tripId         String        @db.Uuid
+  tripLegId      String        @unique @db.Uuid
+  userId         String        @db.Uuid
+  provider       ProviderName
+  mode           TransportMode
+  status         BookingStatus @default(PENDING)
+  providerRef    String?
+  fareQuoteId    String?       @db.Uuid
+  fareQuote      FareQuote?    @relation(fields: [fareQuoteId], references: [id])
+  priceAmount    BigInt
+  priceCurrency  String        @db.Char(3)
+  idempotencyKey String        @unique
+  version        Int           @default(0)
+  segments       Json
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@index([tripId])
+  @@index([status, updatedAt])
+  @@schema("booking")
+}
+
+model FareQuote {
+  id        String             @id @default(uuid()) @db.Uuid
+  provider  ProviderName
+  amount    BigInt
+  currency  String             @db.Char(3)
+  expiresAt DateTime
+  raw       Json
+  bookings  TransportBooking[]
+  createdAt DateTime           @default(now())
+
+  @@index([expiresAt])
+  @@schema("booking")
+}
+
+model StayBooking {
+  id                 String        @id @default(uuid()) @db.Uuid
+  tripId             String        @db.Uuid
+  tripLegId          String        @unique @db.Uuid
+  userId             String        @db.Uuid
+  provider           ProviderName
+  externalPropertyId String
+  status             BookingStatus @default(PENDING)
+  providerRef        String?
+  checkIn            DateTime
+  checkOut           DateTime
+  priceAmount        BigInt
+  priceCurrency      String        @db.Char(3)
+  cancellationPolicy Json // SNAPSHOT (INV-B5)
+  idempotencyKey     String        @unique
+  version            Int           @default(0)
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  @@index([tripId])
+  @@index([status, updatedAt])
+  @@schema("booking")
+}
+
+// ============================ PAYMENTS (double-entry) ============================
+model PaymentIntent {
+  id                    String        @id @default(uuid()) @db.Uuid
+  tripId                String        @db.Uuid // logical ref
+  userId                String        @db.Uuid
+  status                PaymentStatus @default(CREATED)
+  amount                BigInt // authorized amount, minor units
+  capturedAmount        BigInt        @default(0)
+  refundedAmount        BigInt        @default(0)
+  currency              String        @db.Char(3)
+  stripePaymentIntentId String?       @unique
+  clientSecret          String?
+  idempotencyKey        String        @unique
+  version               Int           @default(0)
+  charges               Charge[]
+  refunds               Refund[]
+  disputes              Dispute[]
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+
+  @@index([tripId])
+  @@index([status, updatedAt])
+  @@index([userId, createdAt(sort: Desc)])
+  @@schema("payment")
+}
+
+model Charge {
+  id              String        @id @default(uuid()) @db.Uuid
+  paymentIntentId String        @db.Uuid
+  paymentIntent   PaymentIntent @relation(fields: [paymentIntentId], references: [id])
+  stripeChargeId  String        @unique // INV-P4
+  amount          BigInt
+  currency        String        @db.Char(3)
+  capturedAt      DateTime?
+  createdAt       DateTime      @default(now())
+
+  @@index([paymentIntentId])
+  @@schema("payment")
+}
+
+model Refund {
+  id              String        @id @default(uuid()) @db.Uuid
+  paymentIntentId String        @db.Uuid
+  paymentIntent   PaymentIntent @relation(fields: [paymentIntentId], references: [id])
+  tripLegId       String?       @db.Uuid
+  status          RefundStatus  @default(REQUESTED)
+  amount          BigInt
+  currency        String        @db.Char(3)
+  reason          String
+  stripeRefundId  String?       @unique
+  idempotencyKey  String        @unique
+  version         Int           @default(0)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@index([paymentIntentId])
+  @@index([status, updatedAt])
+  @@schema("payment")
+}
+
+model Dispute {
+  id              String        @id @default(uuid()) @db.Uuid
+  paymentIntentId String        @db.Uuid
+  paymentIntent   PaymentIntent @relation(fields: [paymentIntentId], references: [id])
+  stripeDisputeId String        @unique
+  amount          BigInt
+  currency        String        @db.Char(3)
+  status          String // OPEN | WON | LOST
+  dueBy           DateTime?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@index([status, dueBy])
+  @@schema("payment")
+}
+
+model LedgerAccount {
+  id      String        @id @default(uuid()) @db.Uuid
+  code    String        @unique // USER_CASH | STRIPE_CLEARING | REVENUE | REFUNDS_PAYABLE
+  name    String
+  entries LedgerEntry[]
+
+  @@schema("payment")
+}
+
+model LedgerEntry {
+  id              String          @id @default(uuid()) @db.Uuid
+  accountId       String          @db.Uuid
+  account         LedgerAccount   @relation(fields: [accountId], references: [id])
+  paymentIntentId String?         @db.Uuid
+  refundId        String?         @db.Uuid
+  direction       LedgerDirection
+  amount          BigInt
+  currency        String          @db.Char(3)
+  transactionId   String          @db.Uuid // groups entries of one movement; sum within = 0
+  memo            String?
+  createdAt       DateTime        @default(now())
+
+  @@index([accountId, createdAt])
+  @@index([transactionId])
+  @@index([paymentIntentId])
+  @@schema("payment")
+}
+
+// ============================ NOTIFICATIONS ============================
+model Notification {
+  id            String              @id @default(uuid()) @db.Uuid
+  userId        String              @db.Uuid
+  channel       NotificationChannel
+  templateId    String
+  dedupeKey     String
+  status        NotificationStatus  @default(QUEUED)
+  payload       Json
+  attempts      Int                 @default(0)
+  nextAttemptAt DateTime?
+  correlationId String?             @db.Uuid
+  deliveries    DeliveryAttempt[]
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+
+  @@unique([userId, templateId, dedupeKey]) // no double-send
+  @@index([status, nextAttemptAt])
+  @@schema("notify")
+}
+
+model DeliveryAttempt {
+  id               String              @id @default(uuid()) @db.Uuid
+  notificationId   String              @db.Uuid
+  notification     Notification        @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+  channel          NotificationChannel
+  succeeded        Boolean
+  providerResponse Json?
+  createdAt        DateTime            @default(now())
+
+  @@index([notificationId])
+  @@schema("notify")
+}
+
+// ============================ PROVIDER INTEGRATION ============================
+model ProviderRequest {
+  id             String       @id @default(uuid()) @db.Uuid
+  provider       ProviderName
+  operation      String // RESERVE | CONFIRM | CANCEL | QUOTE
+  idempotencyKey String
+  bookingId      String?      @db.Uuid
+  requestHash    String
+  responseStatus Int?
+  responseBody   Json?
+  succeeded      Boolean      @default(false)
+  createdAt      DateTime     @default(now())
+
+  @@unique([provider, idempotencyKey]) // provider-call idempotency
+  @@index([bookingId])
+  @@schema("provider")
+}
+
+model CircuitState {
+  provider  ProviderName @id
+  state     String       @default("CLOSED") // CLOSED | OPEN | HALF_OPEN
+  failures  Int          @default(0)
+  openedAt  DateTime?
+  updatedAt DateTime     @updatedAt
+
+  @@schema("provider")
+}
+
+// ============================ PLATFORM (shared kernel) ============================
+model OutboxEvent {
+  id            String       @id @default(uuid()) @db.Uuid
+  eventId       String       @unique @db.Uuid
+  eventType     String
+  eventVersion  Int          @default(1)
+  aggregateType String
+  aggregateId   String
+  correlationId String?      @db.Uuid
+  causationId   String?      @db.Uuid
+  tripId        String?      @db.Uuid
+  userId        String?      @db.Uuid
+  payload       Json
+  status        OutboxStatus @default(PENDING)
+  occurredAt    DateTime     @default(now())
+  publishedAt   DateTime?
+  attempts      Int          @default(0)
+  createdAt     DateTime     @default(now())
+
+  @@index([status, occurredAt]) // relay scan (partial WHERE status='PENDING' in migration)
+  @@index([aggregateType, aggregateId])
+  @@schema("platform")
+}
+
+model ProcessedEvent {
+  eventId     String   @db.Uuid
+  consumer    String
+  processedAt DateTime @default(now())
+
+  @@id([eventId, consumer])
+  @@schema("platform")
+}
+
+model IdempotencyKey {
+  scope          String
+  key            String
+  requestHash    String
+  responseStatus Int?
+  responseBody   Json?
+  lockedAt       DateTime?
+  completedAt    DateTime?
+  createdAt      DateTime  @default(now())
+
+  @@id([scope, key])
+  @@schema("platform")
+}
+
+model WebhookReceipt {
+  source          String // stripe | ticketmaster | ...
+  externalEventId String
+  receivedAt      DateTime  @default(now())
+  processedAt     DateTime?
+
+  @@id([source, externalEventId])
+  @@schema("platform")
+}
+
+model AuditLog {
+  id            String   @id @default(uuid()) @db.Uuid
+  actorType     String // USER | SYSTEM | OPS
+  actorId       String?
+  action        String
+  resourceType  String
+  resourceId    String
+  correlationId String?  @db.Uuid
+  metadata      Json?
+  createdAt     DateTime @default(now())
+
+  @@index([resourceType, resourceId])
+  @@index([createdAt])
+  @@schema("platform")
+}
