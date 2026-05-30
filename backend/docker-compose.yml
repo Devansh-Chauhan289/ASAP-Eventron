@@ -1,0 +1,40 @@
+# Local dev dependencies for ASAP backend (Phase 1).
+# Mirrors AWS RDS PostgreSQL + ElastiCache Redis. `docker compose up -d` then run migrations.
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: asap-postgres
+    environment:
+      POSTGRES_USER: asap
+      POSTGRES_PASSWORD: asap
+      POSTGRES_DB: asap
+    ports:
+      - '5432:5432'
+    volumes:
+      - asap_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U asap']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Cache instance (allkeys-lru) — for read caching. Never holds durable state.
+  redis-cache:
+    image: redis:7-alpine
+    container_name: asap-redis-cache
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - '6380:6379'
+
+  # Queue instance (noeviction) — BullMQ jobs are durable and must never be evicted.
+  redis:
+    image: redis:7-alpine
+    container_name: asap-redis-queue
+    command: redis-server --maxmemory-policy noeviction
+    ports:
+      - '6379:6379'
+
+volumes:
+  asap_pgdata:

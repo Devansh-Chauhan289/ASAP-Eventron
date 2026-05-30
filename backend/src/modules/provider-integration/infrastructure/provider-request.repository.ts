@@ -32,7 +32,7 @@ export class ProviderRequestRepository {
     bookingId?: string;
     requestHash: string;
     responseStatus: number;
-    responseBody: Record<string, unknown>;
+    responseBody: object;
     succeeded: boolean;
   }): Promise<void> {
     await this.prisma.providerRequest.upsert({

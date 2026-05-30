@@ -1,0 +1,41 @@
+
+> asap-eventron-frontend@0.1.0 build
+> next build
+
+  ▲ Next.js 14.2.15
+  - Environments: .env.local
+
+   Creating an optimized production build ...
+ ✓ Compiled successfully
+   Linting and checking validity of types ...
+   Collecting page data ...
+   Generating static pages (0/11) ...
+   Generating static pages (2/11) 
+   Generating static pages (5/11) 
+   Generating static pages (8/11) 
+ ✓ Generating static pages (11/11)
+   Finalizing page optimization ...
+   Collecting build traces ...
+
+Route (app)                              Size     First Load JS
+┌ ○ /                                    4.88 kB         145 kB
+├ ○ /_not-found                          138 B          87.3 kB
+├ ○ /checkout                            25.1 kB         155 kB
+├ ○ /dashboard                           5.17 kB         146 kB
+├ ○ /events                              1.96 kB         145 kB
+├ ƒ /events/[id]                         6.6 kB          147 kB
+├ ○ /home                                1.15 kB         144 kB
+├ ○ /login                               1.6 kB          132 kB
+├ ○ /profile                             3.95 kB         144 kB
+└ ○ /transport                           3.81 kB         139 kB
++ First Load JS shared by all            87.1 kB
+  ├ chunks/117-7945acf2f2182667.js       31.6 kB
+  ├ chunks/fd9d1056-5d5b8e0b238c0110.js  53.6 kB
+  └ other shared chunks (total)          1.89 kB
+
+
+ƒ Middleware                             26.8 kB
+
+○  (Static)   prerendered as static content
+ƒ  (Dynamic)  server-rendered on demand
+

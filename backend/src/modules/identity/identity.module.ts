@@ -4,6 +4,7 @@ import { AuthController } from './interface/auth.controller';
 import { MeController } from './interface/me.controller';
 import { AuthService } from './application/auth.service';
 import { UserRepository } from './infrastructure/user.repository';
+import { UsersFacade } from './users.facade';
 
 /**
  * Identity & Access (supporting context). Exposes JWT issuance/verification used by the
@@ -13,7 +14,7 @@ import { UserRepository } from './infrastructure/user.repository';
 @Module({
   imports: [JwtModule.register({})],
   controllers: [AuthController, MeController],
-  providers: [AuthService, UserRepository],
-  exports: [JwtModule],
+  providers: [AuthService, UserRepository, UsersFacade],
+  exports: [JwtModule, UsersFacade],
 })
 export class IdentityModule {}
