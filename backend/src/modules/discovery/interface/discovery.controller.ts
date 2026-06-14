@@ -32,6 +32,7 @@ export class DiscoveryController {
         priceFrom: e.priceFrom,
         imageUrl: e.imageUrl,
         availability: e.availability,
+        dates: e.dates,
       })),
       pageInfo: { nextCursor: null, hasMore: false },
     };

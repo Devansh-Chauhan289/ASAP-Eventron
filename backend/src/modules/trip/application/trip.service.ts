@@ -20,6 +20,32 @@ import {
 } from '@shared/contracts/event-booking.contract';
 import { TripRepository, TripWithLegs } from '../infrastructure/trip.repository';
 import { assertTripTransition } from '../domain/trip-status.machine';
+import {
+  computeRefund,
+  RefundComputation,
+  REFUND_POLICY_BANDS,
+} from '../domain/refund-policy';
+
+export interface CancellationQuote {
+  tripId: string;
+  status: string;
+  eventStartsAt: string | null;
+  captured: { amount: number; currency: string };
+  refund: { amount: number; currency: string };
+  penalty: { amount: number; currency: string };
+  refundPercent: number;
+  daysUntilEvent: number | null;
+  reason: string;
+  policy: typeof REFUND_POLICY_BANDS;
+}
+
+export interface CancelResult {
+  tripId: string;
+  status: string;
+  refund: { amount: number; currency: string };
+  penalty: { amount: number; currency: string };
+  refundPercent: number;
+}
 
 /**
  * Trip Orchestration use-cases (Sections 6, 17.5). Owns trip lifecycle up to handing off to
@@ -87,6 +113,13 @@ export class TripService {
       await this.trips.updateChecked(tx, created.id, created.version, {
         anchorLegId: anchorLeg.id,
         authorizedAmount: pending.price.amount,
+        // Capture anchor event date + destination (drives refund timing + orchestration).
+        startsAt: pending.eventStartsAt ? new Date(pending.eventStartsAt) : null,
+        endsAt: pending.eventEndsAt ? new Date(pending.eventEndsAt) : null,
+        arriveBy: pending.eventStartsAt ? new Date(pending.eventStartsAt) : null,
+        destinationCity: pending.destinationCity,
+        destinationLat: pending.destinationLat,
+        destinationLng: pending.destinationLng,
       });
       await this.outbox.append(tx, [
         this.tripEvent(created, EVENTS.TRIP_CREATED, {
@@ -196,7 +229,7 @@ export class TripService {
     await this.saga.add(
       'drive',
       { tripId: trip.id },
-      { jobId: `trip-saga:${trip.id}`, attempts: 5, backoff: { type: 'exponential', delay: 2000 } },
+      { jobId: `trip-saga-${trip.id}`, attempts: 5, backoff: { type: 'exponential', delay: 2000 } },
     );
 
     return { tripId: trip.id, status: 'BOOKING' };
@@ -211,16 +244,40 @@ export class TripService {
   }
 
   /**
-   * Phase-1 cancellation: pre-booking trips are fully cancelled (auth voided if any).
-   * Cancelling a CONFIRMED trip records the request and emits the event; the refund saga
-   * that settles money is delivered in Phase 2 (see docs/architecture/18-roadmap.md §18.4).
+   * Preview a cancellation WITHOUT executing it — returns the refund the time-based policy
+   * would yield right now, plus the policy bands for the UI timeline. Read-only.
    */
-  async cancel(
+  async quoteCancellation(
     tripId: string,
     userId: string,
-  ): Promise<{ tripId: string; status: string }> {
+  ): Promise<CancellationQuote> {
     const trip = await this.requireTrip(tripId, userId);
+    const comp = computeRefund(trip.capturedAmount, trip.startsAt, new Date());
+    return {
+      tripId: trip.id,
+      status: trip.status,
+      eventStartsAt: trip.startsAt?.toISOString() ?? null,
+      captured: { amount: Number(trip.capturedAmount), currency: trip.currency },
+      refund: { amount: Number(comp.refundAmount), currency: trip.currency },
+      penalty: { amount: Number(comp.penaltyAmount), currency: trip.currency },
+      refundPercent: comp.refundPercent,
+      daysUntilEvent: comp.daysUntilEvent,
+      reason: comp.reason,
+      policy: REFUND_POLICY_BANDS,
+    };
+  }
 
+  /**
+   * Cancellation with the time-based refund policy (Section 4.5):
+   *   ≥10 days → 100%, 5–9 days → 50%, <5 days/day-of → 0%.
+   * Pre-booking trips are simply cancelled (auth voided). For a CONFIRMED trip we cancel the
+   * provider booking FIRST (stop fulfilment), then refund the policy amount, then finalise.
+   */
+  async cancel(tripId: string, userId: string): Promise<CancelResult> {
+    const trip = await this.requireTrip(tripId, userId);
+    const zero = { amount: 0, currency: trip.currency };
+
+    // Pre-booking: nothing captured — void any authorization, cancel outright.
     if (trip.status === 'PLANNING' || trip.status === 'PENDING_PAYMENT') {
       if (trip.paymentIntentId) {
         await this.payments
@@ -239,23 +296,83 @@ export class TripService {
           this.tripEvent(trip, EVENTS.TRIP_CANCELLED, { reason: 'user_pre_booking' }),
         ]);
       });
-      return { tripId: trip.id, status: 'CANCELLED' };
+      return { tripId: trip.id, status: 'CANCELLED', refund: zero, penalty: zero, refundPercent: 100 };
     }
 
-    if (trip.status === 'CONFIRMED') {
-      await this.prisma.runTransaction(async (tx) => {
-        assertTripTransition(trip.status, 'CANCELLATION_REQUESTED');
-        await this.trips.updateChecked(tx, trip.id, trip.version, {
-          status: 'CANCELLATION_REQUESTED',
-        });
-        await this.outbox.append(tx, [
-          this.tripEvent(trip, EVENTS.TRIP_CANCELLED, { reason: 'user_requested' }),
-        ]);
+    if (trip.status !== 'CONFIRMED') {
+      throw new BusinessRuleError(`Cannot cancel a trip in ${trip.status}`);
+    }
+
+    const comp: RefundComputation = computeRefund(
+      trip.capturedAmount,
+      trip.startsAt,
+      new Date(),
+    );
+    const anchorLeg = trip.legs.find((l) => l.type === 'EVENT');
+
+    // 1) Mark the cancellation requested.
+    await this.prisma.runTransaction(async (tx) => {
+      assertTripTransition(trip.status, 'CANCELLATION_REQUESTED');
+      await this.trips.updateChecked(tx, trip.id, trip.version, {
+        status: 'CANCELLATION_REQUESTED',
       });
-      return { tripId: trip.id, status: 'CANCELLATION_REQUESTED' };
+    });
+
+    // 2) Cancel the provider reservation FIRST (stop fulfilment) — external, no tx.
+    if (anchorLeg?.bookingId) {
+      await this.eventBooking.cancel({
+        bookingId: anchorLeg.bookingId,
+        idempotencyKey: `trip:${trip.id}:cancel-${anchorLeg.id}`,
+      });
     }
 
-    throw new BusinessRuleError(`Cannot cancel a trip in ${trip.status}`);
+    // 3) Refund the policy amount (if any) — external, no tx.
+    if (comp.refundAmount > 0n && trip.paymentIntentId) {
+      await this.payments.refund({
+        paymentIntentId: trip.paymentIntentId,
+        amount: Money.of(comp.refundAmount, trip.currency),
+        reason: comp.reason,
+        idempotencyKey: `trip:${trip.id}:refund`,
+        tripLegId: anchorLeg?.id,
+      });
+    }
+
+    // 4) Finalise → CANCELLED, record refunded total, mark leg cancelled, emit events.
+    await this.prisma.runTransaction(async (tx) => {
+      const fresh = await this.trips.findById(trip.id, tx);
+      if (!fresh) return;
+      assertTripTransition(fresh.status, 'CANCELLED');
+      await this.trips.updateChecked(tx, trip.id, fresh.version, {
+        status: 'CANCELLED',
+        refundedAmount: comp.refundAmount,
+      });
+      if (anchorLeg) {
+        await this.trips.updateLeg(tx, anchorLeg.id, {
+          status: 'CANCELLED',
+          cancelledAt: new Date(),
+        });
+      }
+      await this.outbox.append(tx, [
+        this.tripEvent(trip, EVENTS.TRIP_CANCELLED, {
+          reason: comp.reason,
+          refundAmount: Number(comp.refundAmount),
+          refundPercent: comp.refundPercent,
+          daysUntilEvent: comp.daysUntilEvent,
+        }),
+        this.notify(trip, 'trip_cancelled', {
+          tripId: trip.id,
+          refundAmount: Number(comp.refundAmount),
+        }),
+      ]);
+    });
+
+    return {
+      tripId: trip.id,
+      status: 'CANCELLED',
+      refund: { amount: Number(comp.refundAmount), currency: trip.currency },
+      penalty: { amount: Number(comp.penaltyAmount), currency: trip.currency },
+      refundPercent: comp.refundPercent,
+    };
   }
 
   // ── helpers ───────────────────────────────────────────────
@@ -284,6 +401,28 @@ export class TripService {
       userId: trip.userId,
       correlationId: CorrelationContext.correlationId() ?? null,
       payload: { tripId: trip.id, ...extra },
+    });
+  }
+
+  private notify(
+    trip: TripWithLegs,
+    templateId: string,
+    data: Record<string, unknown>,
+  ) {
+    return makeEvent({
+      eventType: EVENTS.NOTIFICATION_DISPATCH_REQUESTED,
+      aggregateType: 'Trip',
+      aggregateId: trip.id,
+      tripId: trip.id,
+      userId: trip.userId,
+      correlationId: CorrelationContext.correlationId() ?? null,
+      payload: {
+        userId: trip.userId,
+        channel: 'EMAIL',
+        templateId,
+        dedupeKey: `${templateId}:${trip.id}`,
+        data,
+      },
     });
   }
 }

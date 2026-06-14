@@ -4,13 +4,13 @@ import { NextResponse, type NextRequest } from "next/server";
 const PROTECTED = ["/home", "/dashboard", "/checkout", "/trips", "/profile"];
 
 // Explicitly public route prefixes.
-const PUBLIC = ["/", "/events", "/auth", "/login"];
+const PUBLIC = ["/", "/events", "/auth", "/login", "/register"];
 
 const ACCESS_COOKIE = "asap_access";
 const REFRESH_COOKIE = "asap_refresh";
 
 const API_BASE =
-  process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3000/api/v1";
+  process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:1201/api/v1";
 
 function isProtected(pathname: string): boolean {
   return PROTECTED.some(
@@ -25,24 +25,21 @@ function isPublic(pathname: string): boolean {
   );
 }
 
-/** Silently exchange the refresh token for a new access token. */
+/** Silently exchange the refresh token for a new token pair (backend contract). */
 async function refreshAccess(
   refreshToken: string,
-): Promise<string | null> {
+): Promise<{ accessToken: string; refreshToken: string } | null> {
   try {
     const res = await fetch(`${API_BASE}/auth/refresh`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Cookie: `${REFRESH_COOKIE}=${refreshToken}`,
-      },
-      body: JSON.stringify({}),
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refreshToken }),
     });
     if (!res.ok) return null;
     const data = (await res.json().catch(() => null)) as
-      | { accessToken?: string }
+      | { tokens?: { accessToken: string; refreshToken: string } }
       | null;
-    return data?.accessToken ?? null;
+    return data?.tokens ?? null;
   } catch {
     return null;
   }
@@ -68,11 +65,18 @@ export async function middleware(req: NextRequest) {
   // No access token — try a silent refresh before bouncing to /login.
   const refresh = req.cookies.get(REFRESH_COOKIE)?.value;
   if (refresh) {
-    const newAccess = await refreshAccess(refresh);
-    if (newAccess) {
+    const newTokens = await refreshAccess(refresh);
+    if (newTokens) {
       const res = NextResponse.next();
-      res.cookies.set(ACCESS_COOKIE, newAccess, {
-        httpOnly: true,
+      // NOT httpOnly: the Bearer-auth API client reads this cookie to authorize requests.
+      res.cookies.set(ACCESS_COOKIE, newTokens.accessToken, {
+        httpOnly: false,
+        sameSite: "lax",
+        secure: process.env.NODE_ENV === "production",
+        path: "/",
+      });
+      res.cookies.set(REFRESH_COOKIE, newTokens.refreshToken, {
+        httpOnly: false,
         sameSite: "lax",
         secure: process.env.NODE_ENV === "production",
         path: "/",

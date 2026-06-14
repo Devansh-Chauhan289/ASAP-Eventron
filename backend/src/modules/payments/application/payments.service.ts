@@ -257,6 +257,115 @@ export class PaymentsService {
     );
   }
 
+  async refund(input: {
+    paymentIntentId: string;
+    amount: { amount: bigint; currency: string };
+    reason: string;
+    idempotencyKey: string;
+    tripLegId?: string;
+  }): Promise<{ ok: boolean; refundId: string; status: string; refundedAmount: number }> {
+    // Idempotent: a prior refund with this key returns the same record.
+    const prior = await this.payments.findRefundByIdempotencyKey(input.idempotencyKey);
+    if (prior) {
+      return {
+        ok: true,
+        refundId: prior.id,
+        status: prior.status,
+        refundedAmount: Number(prior.amount),
+      };
+    }
+
+    const pi = await this.requireIntent(input.paymentIntentId);
+    if (pi.status !== 'CAPTURED' && pi.status !== 'PARTIALLY_REFUNDED') {
+      throw new BusinessRuleError(`Cannot refund from status ${pi.status}`);
+    }
+    const remaining = pi.capturedAmount - pi.refundedAmount;
+    if (input.amount.amount > remaining) {
+      // INV-P3: never refund more than captured-minus-already-refunded.
+      throw new BusinessRuleError('Refund exceeds remaining captured amount');
+    }
+    if (input.amount.amount <= 0n) {
+      throw new BusinessRuleError('Refund amount must be positive');
+    }
+    if (!pi.stripePaymentIntentId) {
+      throw new BusinessRuleError('PaymentIntent has no Stripe intent to refund');
+    }
+
+    // EXTERNAL refund (outside any tx).
+    const stripeRefund = await this.stripe.createRefund({
+      stripePaymentIntentId: pi.stripePaymentIntentId,
+      amount: input.amount.amount,
+      idempotencyKey: input.idempotencyKey,
+    });
+
+    const newRefunded = pi.refundedAmount + input.amount.amount;
+    const newStatus: PaymentStatus =
+      newRefunded >= pi.capturedAmount ? 'REFUNDED' : 'PARTIALLY_REFUNDED';
+
+    const refundId = await this.prisma.runTransaction(
+      async (tx) => {
+        const refund = await this.payments.createRefund(tx, {
+          paymentIntentId: pi.id,
+          tripLegId: input.tripLegId,
+          amount: input.amount.amount,
+          currency: input.amount.currency,
+          reason: input.reason,
+          stripeRefundId: stripeRefund.id,
+          idempotencyKey: input.idempotencyKey,
+          status: 'SUCCEEDED',
+        });
+        assertPaymentTransition(pi.status, newStatus);
+        await this.payments.updateChecked(tx, pi.id, pi.version, {
+          status: newStatus,
+          refundedAmount: newRefunded,
+        });
+        // Double-entry reversal of (part of) the capture: revenue down, clearing down.
+        await this.ledger.post(tx, {
+          currency: input.amount.currency,
+          paymentIntentId: pi.id,
+          refundId: refund.id,
+          memo: `refund ${refund.id}`,
+          entries: [
+            {
+              accountCode: LEDGER_ACCOUNTS.REVENUE,
+              direction: 'DEBIT',
+              amount: input.amount.amount,
+            },
+            {
+              accountCode: LEDGER_ACCOUNTS.STRIPE_CLEARING,
+              direction: 'CREDIT',
+              amount: input.amount.amount,
+            },
+          ],
+        });
+        await this.outbox.append(tx, [
+          makeEvent({
+            eventType: EVENTS.PAYMENT_REFUND_SUCCEEDED,
+            aggregateType: 'PaymentIntent',
+            aggregateId: pi.id,
+            tripId: pi.tripId,
+            userId: pi.userId,
+            correlationId: CorrelationContext.correlationId() ?? null,
+            payload: {
+              paymentIntentId: pi.id,
+              refundId: refund.id,
+              amount: Number(input.amount.amount),
+            },
+          }),
+        ]);
+        return refund.id;
+      },
+      { isolationLevel: 'Serializable' },
+    );
+
+    return {
+      ok: true,
+      refundId,
+      status: 'SUCCEEDED',
+      refundedAmount: Number(input.amount.amount),
+    };
+  }
+
   async getSummary(paymentIntentId: string): Promise<PaymentSummary | null> {
     const pi = await this.payments.findById(paymentIntentId);
     if (!pi) return null;

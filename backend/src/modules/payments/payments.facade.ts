@@ -7,6 +7,7 @@ import {
   CreateIntentResult,
   PaymentsPort,
   PaymentSummary,
+  RefundResult,
 } from '@shared/contracts/payments.contract';
 import { PaymentsService } from './application/payments.service';
 
@@ -47,6 +48,22 @@ export class PaymentsFacade implements PaymentsPort {
     idempotencyKey: string;
   }): Promise<void> {
     return this.payments.voidIntent(input);
+  }
+
+  refund(input: {
+    paymentIntentId: string;
+    amount: Money;
+    reason: string;
+    idempotencyKey: string;
+    tripLegId?: string;
+  }): Promise<RefundResult> {
+    return this.payments.refund({
+      paymentIntentId: input.paymentIntentId,
+      amount: { amount: input.amount.amount, currency: input.amount.currency },
+      reason: input.reason,
+      idempotencyKey: input.idempotencyKey,
+      tripLegId: input.tripLegId,
+    });
   }
 
   getSummary(paymentIntentId: string): Promise<PaymentSummary | null> {

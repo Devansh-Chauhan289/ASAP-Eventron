@@ -19,6 +19,12 @@ export interface CreatePendingEventBookingInput {
 export interface CreatePendingEventBookingResult {
   bookingId: string;
   price: Money;
+  // Anchor metadata captured from the provider event (drives orchestration + refund timing).
+  eventStartsAt: string | null; // ISO
+  eventEndsAt: string | null;
+  destinationCity: string | null;
+  destinationLat: number | null;
+  destinationLng: number | null;
 }
 
 export interface ReserveResult {
@@ -41,4 +47,6 @@ export interface EventBookingPort {
     idempotencyKey: string;
   }): Promise<{ ok: boolean; providerRef: string }>;
   release(input: { bookingId: string; idempotencyKey: string }): Promise<void>;
+  /** Cancels a CONFIRMED booking (post-purchase cancellation). */
+  cancel(input: { bookingId: string; idempotencyKey: string }): Promise<void>;
 }

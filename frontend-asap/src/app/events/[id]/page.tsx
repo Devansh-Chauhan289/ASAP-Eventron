@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import Image from "next/image";
 import Link from "next/link";
@@ -17,13 +17,16 @@ import {
   MapPin,
   ChevronDown,
   Tag,
+  Loader2,
 } from "lucide-react";
 import { AppShell } from "@/components/AppShell";
 import { SmartTag } from "@/components/SmartTag";
 import { TicketSelector } from "@/components/TicketSelector";
 import { getEvent } from "@/lib/data";
 import { formatMoney } from "@/lib/money";
-import type { Money } from "@/lib/types";
+import { api } from "@/lib/api";
+import { mapApiEvent, type ApiEvent } from "@/lib/map";
+import type { Money, EventItem } from "@/lib/types";
 
 const SERVICE_FEE_RATE = 0.02; // illustrative
 
@@ -33,14 +36,42 @@ export default function EventDetailPage({
   params: { id: string };
 }) {
   const router = useRouter();
-  const event = getEvent(params.id);
-  if (!event) notFound();
-
-  const tiers = useMemo(() => event.ticketTiers ?? [], [event]);
+  const [event, setEvent] = useState<EventItem | null>(null);
+  const [loading, setLoading] = useState(true);
   const [quantities, setQuantities] = useState<Record<string, number>>({});
   const [aboutOpen, setAboutOpen] = useState(false);
   const [promo, setPromo] = useState("");
   const [saved, setSaved] = useState(false);
+  // Which performance (night) the user picked. Index into event.dates.
+  const [dateIdx, setDateIdx] = useState(0);
+
+  // Fetch the real event from the backend (Ticketmaster). Fall back to local sample
+  // data when the id is a sample slug or the backend is unreachable.
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      try {
+        const raw = (await api.getEvent(params.id)) as ApiEvent | null;
+        if (!active) return;
+        if (raw && raw.externalId) setEvent(mapApiEvent(raw));
+        else setEvent(getEvent(params.id) ?? null);
+      } catch {
+        if (active) setEvent(getEvent(params.id) ?? null);
+      } finally {
+        if (active) setLoading(false);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [params.id]);
+
+  const tiers = useMemo(() => event?.ticketTiers ?? [], [event]);
+
+  // All performances of this show (residencies list many; single events list one).
+  const dates = useMemo(() => event?.dates ?? [], [event]);
+  const multiDate = dates.length > 1;
+  const selectedDate = dates[dateIdx] ?? dates[0];
 
   const setQty = (id: string, qty: number) =>
     setQuantities((prev) => ({ ...prev, [id]: qty }));
@@ -62,7 +93,19 @@ export default function EventDetailPage({
   const fee = Math.round(subtotal.amount * SERVICE_FEE_RATE);
   const total: Money = { amount: subtotal.amount + fee, currency: subtotal.currency };
 
+  if (loading) {
+    return (
+      <AppShell>
+        <div className="flex min-h-[60vh] items-center justify-center">
+          <Loader2 className="h-8 w-8 animate-spin text-primary" />
+        </div>
+      </AppShell>
+    );
+  }
+  if (!event) notFound();
+
   const handleBook = () => {
+    if (!event) return;
     const selection = tiers
       .filter((t) => (quantities[t.id] ?? 0) > 0)
       .map((t) => ({
@@ -75,9 +118,11 @@ export default function EventDetailPage({
       sessionStorage.setItem(
         "asap.checkout",
         JSON.stringify({
-          eventId: event.id,
+          // Book the specific performance the user selected (its own bookable id).
+          eventId: selectedDate?.externalId ?? event.id,
           eventTitle: event.title,
-          date: event.date,
+          date: selectedDate?.date ?? event.date,
+          time: selectedDate?.time ?? event.time,
           venue: event.venue,
           selection,
           promo,
@@ -148,8 +193,12 @@ export default function EventDetailPage({
         {/* Info row */}
         <div className="grid grid-cols-3 gap-3">
           {[
-            { Icon: Calendar, label: "Date", value: event.date.split(",")[0] },
-            { Icon: Clock, label: "Time", value: event.time ?? "—" },
+            {
+              Icon: Calendar,
+              label: "Date",
+              value: (selectedDate?.date ?? event.date).split(",")[0],
+            },
+            { Icon: Clock, label: "Time", value: selectedDate?.time ?? event.time ?? "—" },
             {
               Icon: Users,
               label: "Capacity",
@@ -242,12 +291,74 @@ export default function EventDetailPage({
           </div>
         )}
 
+        {/* Select date — shown when the show runs on multiple nights (e.g. a residency) */}
+        {multiDate && (
+          <section className="mt-8">
+            <h2 className="mb-1 text-xl font-bold text-ink-primary">
+              Select a Date
+            </h2>
+            <p className="mb-4 text-sm text-ink-secondary">
+              {dates.length} dates available at {event.venue} — choose the night
+              you want tickets for.
+            </p>
+            <div className="no-scrollbar flex gap-3 overflow-x-auto pb-2">
+              {dates.map((d, i) => {
+                const active = i === dateIdx;
+                const [mon, ...rest] = d.date.replace(",", "").split(" ");
+                const dayNum = rest[0];
+                const year = rest[1];
+                return (
+                  <button
+                    key={d.externalId}
+                    type="button"
+                    disabled={d.soldOut}
+                    onClick={() => setDateIdx(i)}
+                    className={`flex min-w-[88px] shrink-0 flex-col items-center rounded-lg border-2 px-4 py-3 transition-colors ${
+                      active
+                        ? "border-primary bg-primary-50"
+                        : "border-gray-200 bg-white hover:border-primary/40"
+                    } ${d.soldOut ? "cursor-not-allowed opacity-40" : ""}`}
+                  >
+                    <span
+                      className={`text-xs font-bold uppercase ${
+                        active ? "text-primary" : "text-ink-secondary"
+                      }`}
+                    >
+                      {mon}
+                    </span>
+                    <span className="text-2xl font-extrabold text-ink-primary">
+                      {dayNum}
+                    </span>
+                    <span className="text-[11px] text-ink-secondary">{year}</span>
+                    {d.time && (
+                      <span className="mt-1 text-[11px] font-medium text-ink-secondary">
+                        {d.time}
+                      </span>
+                    )}
+                    {d.soldOut && (
+                      <span className="mt-1 text-[10px] font-semibold text-tag-soldout">
+                        Sold Out
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </section>
+        )}
+
         {/* Tickets */}
         {tiers.length > 0 && (
           <section className="mt-8">
-            <h2 className="mb-4 text-xl font-bold text-ink-primary">
+            <h2 className="mb-1 text-xl font-bold text-ink-primary">
               Select Tickets
             </h2>
+            {selectedDate && (
+              <p className="mb-4 text-sm text-ink-secondary">
+                For <span className="font-semibold text-ink-primary">{selectedDate.date}</span>
+                {selectedDate.time ? ` · ${selectedDate.time}` : ""}
+              </p>
+            )}
             <div className="flex flex-col gap-3">
               {tiers.map((tier) => (
                 <TicketSelector

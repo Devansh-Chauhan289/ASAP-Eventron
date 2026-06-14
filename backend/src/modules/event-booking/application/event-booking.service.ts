@@ -40,18 +40,27 @@ export class EventBookingService {
   async createPending(
     input: CreatePendingEventBookingInput,
   ): Promise<CreatePendingEventBookingResult> {
+    // EXTERNAL: quote the price + capture anchor metadata for the basket (outside any tx).
+    const event = await this.provider.getEvent(input.externalEventId);
+    const unit = event?.priceFrom ?? { amount: 5000, currency: 'USD' };
+    const meta = {
+      eventStartsAt: event?.startsAt ?? null,
+      eventEndsAt: event?.endsAt ?? null,
+      destinationCity: event?.venue.city ?? null,
+      destinationLat: event?.venue.lat ?? null,
+      destinationLng: event?.venue.lng ?? null,
+    };
+
     // Idempotent: same key (per leg) returns the existing booking.
     const existing = await this.bookings.findByLeg(input.tripLegId);
     if (existing) {
       return {
         bookingId: existing.id,
         price: Money.of(existing.priceAmount, existing.priceCurrency),
+        ...meta,
       };
     }
 
-    // EXTERNAL: quote the price for the basket (outside any tx).
-    const event = await this.provider.getEvent(input.externalEventId);
-    const unit = event?.priceFrom ?? { amount: 5000, currency: 'USD' };
     const price = Money.of(
       BigInt(unit.amount) * BigInt(input.quantity),
       unit.currency,
@@ -65,10 +74,10 @@ export class EventBookingService {
       priceAmount: price.amount,
       priceCurrency: price.currency,
       idempotencyKey: input.idempotencyKey,
-      attributes: { quantity: input.quantity, tier: input.tier },
+      attributes: { quantity: input.quantity, tier: input.tier, ...meta },
     });
 
-    return { bookingId: booking.id, price };
+    return { bookingId: booking.id, price, ...meta };
   }
 
   async reserve(input: {
@@ -195,6 +204,37 @@ export class EventBookingService {
       await this.bookings.setStatus(tx, booking.id, booking.version, 'RELEASED');
       await this.outbox.append(tx, [
         this.event(EVENTS.BOOKING_EVENT_RELEASED, booking, {}),
+      ]);
+    });
+  }
+
+  async cancel(input: {
+    bookingId: string;
+    idempotencyKey: string;
+  }): Promise<void> {
+    let booking = await this.require(input.bookingId);
+    if (booking.status === 'CANCELLED' || booking.status === 'RELEASED') return;
+    if (booking.status !== 'CONFIRMED') {
+      // Not yet confirmed → a release is the right reversal.
+      return this.release(input);
+    }
+
+    if (booking.providerRef) {
+      await this.provider.cancel({
+        providerRef: booking.providerRef,
+        idempotencyKey: input.idempotencyKey,
+      });
+    }
+    await this.prisma.runTransaction(async (tx) => {
+      assertBookingTransition(booking.status, 'CANCELLING');
+      await this.bookings.setStatus(tx, booking.id, booking.version, 'CANCELLING');
+    });
+    booking = await this.require(input.bookingId);
+    await this.prisma.runTransaction(async (tx) => {
+      assertBookingTransition(booking.status, 'CANCELLED');
+      await this.bookings.setStatus(tx, booking.id, booking.version, 'CANCELLED');
+      await this.outbox.append(tx, [
+        this.event(EVENTS.BOOKING_EVENT_RELEASED, booking, { cancelled: true }),
       ]);
     });
   }

@@ -17,16 +17,18 @@ interface StripePaymentStepProps {
   tripId: string;
   amount: Money;
   promoSaved?: Money | null;
-  onPaid: () => void;
+  onPaid: (paymentIntentId: string) => void;
 }
 
 // ── Inner form rendered once Stripe Elements is mounted ──
 function CardForm({
   amount,
+  paymentIntentId,
   onPaid,
 }: {
   amount: Money;
-  onPaid: () => void;
+  paymentIntentId: string;
+  onPaid: (paymentIntentId: string) => void;
 }) {
   const stripe = useStripe();
   const elements = useElements();
@@ -39,6 +41,7 @@ function CardForm({
     setError(null);
 
     // Stripe renders/validates the card fields — we never touch raw PAN/CVV.
+    // confirmParams.return_url is required for redirect methods; cards stay in-page.
     const { error: stripeError } = await stripe.confirmPayment({
       elements,
       redirect: "if_required",
@@ -49,8 +52,8 @@ function CardForm({
       setSubmitting(false);
       return;
     }
-    // On success the caller triggers POST /trips/{id}/confirm.
-    onPaid();
+    // On success the caller triggers POST /trips/{id}/confirm with this intent id.
+    onPaid(paymentIntentId);
   };
 
   return (
@@ -109,14 +112,14 @@ function DemoCardForm({
   onPaid,
 }: {
   amount: Money;
-  onPaid: () => void;
+  onPaid: (paymentIntentId: string) => void;
 }) {
   const [submitting, setSubmitting] = useState(false);
 
   const handlePay = () => {
     setSubmitting(true);
-    // Simulate Stripe confirmPayment latency, then proceed.
-    setTimeout(onPaid, 1400);
+    // Simulate Stripe confirmPayment latency, then proceed (no real intent → demo path).
+    setTimeout(() => onPaid(""), 1400);
   };
 
   return (
@@ -147,8 +150,10 @@ export function StripePaymentStep({
 }: StripePaymentStepProps) {
   const [method, setMethod] = useState<"card" | "apple" | "google">("card");
   const [clientSecret, setClientSecret] = useState<string | null>(null);
+  const [paymentIntentId, setPaymentIntentId] = useState<string>("");
   const [stripeReady, setStripeReady] = useState<boolean | null>(null);
-  const [useSavedCard, setUseSavedCard] = useState(true);
+  // Default to entering a card (real Stripe Elements) rather than the demo saved card.
+  const [useSavedCard, setUseSavedCard] = useState(false);
   const [saveCard, setSaveCard] = useState(false);
   const [agreed, setAgreed] = useState(false);
   const [promoRemoved, setPromoRemoved] = useState(false);
@@ -166,9 +171,10 @@ export function StripePaymentStep({
         return;
       }
       try {
-        const { clientSecret } = await api.checkout(tripId);
+        const co = await api.checkout(tripId);
         if (active) {
-          setClientSecret(clientSecret);
+          setClientSecret(co.clientSecret);
+          setPaymentIntentId(co.paymentIntentId);
           setStripeReady(true);
         }
       } catch (err) {
@@ -211,7 +217,7 @@ export function StripePaymentStep({
           {method === "apple" ? "Apple Pay" : "Google Pay"} sheet opens on
           supported devices.
           <button
-            onClick={onPaid}
+            onClick={() => onPaid(paymentIntentId)}
             className="mt-4 w-full rounded-md bg-ink-primary py-3 font-semibold text-white"
           >
             Continue with {method === "apple" ? "Apple Pay" : "Google Pay"}
@@ -260,7 +266,11 @@ export function StripePaymentStep({
                 stripe={stripePromise}
                 options={{ clientSecret, appearance: { theme: "stripe" } }}
               >
-                <CardForm amount={amount} onPaid={onPaid} />
+                <CardForm
+                  amount={amount}
+                  paymentIntentId={paymentIntentId}
+                  onPaid={onPaid}
+                />
               </Elements>
             )}
 
@@ -313,7 +323,7 @@ export function StripePaymentStep({
           their own button; wallet methods use their own continue button. */}
       {method === "card" && useSavedCard && (
         <button
-          onClick={onPaid}
+          onClick={() => onPaid(paymentIntentId)}
           disabled={!canPay}
           className="mt-5 flex w-full items-center justify-center gap-2 rounded-md bg-[#635BFF] px-6 py-3.5 font-semibold text-white transition-colors hover:brightness-95 disabled:opacity-50"
         >

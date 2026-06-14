@@ -9,8 +9,12 @@ generator client {
 
 datasource db {
   provider = "postgresql"
+  // Runtime: pooled connection (Supabase Supavisor :6543 transaction mode, or PgBouncer/RDS Proxy).
   url      = env("DATABASE_URL")
-  schemas  = ["identity", "trip", "booking", "payment", "notify", "provider", "platform"]
+  // Migrations & introspection: DIRECT connection (Supabase :5432, bypasses the pooler).
+  // Falls back to DATABASE_URL when unset (e.g. local Docker Postgres has no separate pooler).
+  directUrl = env("DIRECT_URL")
+  schemas   = ["identity", "trip", "booking", "payment", "notify", "provider", "platform"]
 }
 
 // ============================ ENUMS ============================

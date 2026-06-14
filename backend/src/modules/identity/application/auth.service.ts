@@ -141,6 +141,7 @@ export class AuthService {
     const refreshToken = await this.signRefresh(user.userId, sessionId);
     const expiresAt = new Date(Date.now() + this.config.jwt.refreshTtl * 1000);
     await this.users.createSession({
+      id: sessionId, // persist with the SAME id encoded in the refresh JWT
       userId: user.userId,
       refreshHash: this.hashToken(refreshToken),
       expiresAt,

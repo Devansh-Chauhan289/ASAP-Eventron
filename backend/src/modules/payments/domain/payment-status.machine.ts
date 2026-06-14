@@ -7,8 +7,10 @@ import { IllegalStateTransitionError } from '@shared/common/errors/domain-error'
  * (zero money moved).
  */
 const ALLOWED: Record<PaymentStatus, PaymentStatus[]> = {
-  CREATED: ['REQUIRES_PAYMENT_METHOD', 'REQUIRES_CONFIRMATION', 'FAILED'],
-  REQUIRES_PAYMENT_METHOD: ['REQUIRES_CONFIRMATION', 'FAILED'],
+  // The client confirms the card out-of-band (Stripe.js), so our local status can jump
+  // straight to AUTHORIZED once the saga retrieves the real Stripe status (requires_capture).
+  CREATED: ['REQUIRES_PAYMENT_METHOD', 'REQUIRES_CONFIRMATION', 'REQUIRES_ACTION', 'PROCESSING', 'AUTHORIZED', 'FAILED'],
+  REQUIRES_PAYMENT_METHOD: ['REQUIRES_CONFIRMATION', 'REQUIRES_ACTION', 'PROCESSING', 'AUTHORIZED', 'FAILED'],
   REQUIRES_CONFIRMATION: ['REQUIRES_ACTION', 'PROCESSING', 'AUTHORIZED', 'FAILED'],
   REQUIRES_ACTION: ['PROCESSING', 'AUTHORIZED', 'FAILED'],
   PROCESSING: ['AUTHORIZED', 'CAPTURED', 'FAILED'],

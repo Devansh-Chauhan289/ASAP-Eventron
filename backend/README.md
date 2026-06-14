@@ -45,6 +45,15 @@ curl -s localhost:3000/api/v1/trips -H "authorization: Bearer $TOKEN" \
 
 Quality gates: `npm run build` · `npm test` (unit) · `npm run lint` · `RUN_E2E=1 npm run test:e2e` (needs infra + Stripe test keys).
 
+### Using Supabase instead of local Postgres
+
+Supabase is managed PostgreSQL — fully compatible, **no code changes**. In `.env` set the two Supabase connection strings (Dashboard → Project Settings → Database):
+
+- **`DATABASE_URL`** = the **Transaction pooler** string (port `6543`) **+** `?pgbouncer=true&connection_limit=1` — used at runtime.
+- **`DIRECT_URL`** = the **Direct connection** / **Session** pooler string (port `5432`) — used by `prisma migrate`.
+
+Then `npm run prisma:deploy` (the migration `CREATE SCHEMA`s our 7 contexts) → `npm run db:seed`. You still need **Redis** for BullMQ — keep `docker compose up -d redis redis-cache`, or point `REDIS_*` at Upstash/ElastiCache. The pooler/direct split is already wired in `prisma/schema.prisma` (`url` + `directUrl`): the transaction pooler needs `pgbouncer=true` (no prepared statements) and migrations must use `DIRECT_URL` because the pooler doesn't support Prisma Migrate's advisory locks.
+
 ## Stack
 
 Node.js 20 · NestJS (Express) · TypeScript (strict) · PostgreSQL + Prisma · Redis · BullMQ · Stripe · FCM + SendGrid · AWS ECS/Fargate, RDS, ElastiCache, S3, API Gateway, Secrets Manager, CloudWatch.

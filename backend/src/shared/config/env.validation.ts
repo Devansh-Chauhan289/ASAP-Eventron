@@ -13,7 +13,13 @@ export const envSchema = z.object({
     .default('true')
     .transform((v) => v === 'true'),
 
-  DATABASE_URL: z.string().url().or(z.string().startsWith('postgresql://')),
+  // Pooled connection used at runtime (Supabase Supavisor / PgBouncer / RDS Proxy).
+  DATABASE_URL: z.string().url().or(z.string().startsWith('postgres')),
+  // Direct (non-pooled) connection used by Prisma migrations. Defaults to DATABASE_URL.
+  DIRECT_URL: z
+    .string()
+    .startsWith('postgres')
+    .optional(),
 
   REDIS_HOST: z.string().default('localhost'),
   REDIS_PORT: z.coerce.number().int().positive().default(6379),
@@ -26,6 +32,9 @@ export const envSchema = z.object({
 
   STRIPE_SECRET_KEY: z.string().default('sk_test_placeholder'),
   STRIPE_WEBHOOK_SECRET: z.string().default('whsec_placeholder'),
+  // 'live' = call real Stripe; 'mock' = in-memory fake (dev/testing, no keys);
+  // 'auto' (default) = mock when the secret key is a placeholder, else live.
+  PAYMENTS_MODE: z.enum(['live', 'mock', 'auto']).default('auto'),
 
   TICKETMASTER_API_KEY: z.string().default('tm_sandbox_placeholder'),
   TICKETMASTER_BASE_URL: z

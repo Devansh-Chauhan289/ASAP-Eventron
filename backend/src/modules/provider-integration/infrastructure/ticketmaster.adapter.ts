@@ -49,7 +49,47 @@ export class TicketmasterAdapter implements EventProviderPort {
       this.getJson(url.toString()),
     );
     const events = (json?._embedded?.events ?? []) as TmEvent[];
-    return events.map((e) => this.normalize(e));
+    return this.groupByShow(events);
+  }
+
+  /**
+   * Ticketmaster returns ONE event object per performance date, so a residency
+   * (same act, same venue, many nights) arrives as many near-identical objects.
+   * Collapse them into one NormalizedEvent per show, carrying every night in
+   * `dates[]`. Grouping key is the attraction id (falls back to title) + venue id.
+   */
+  private groupByShow(events: TmEvent[]): NormalizedEvent[] {
+    const groups = new Map<string, { base: TmEvent; dates: TmEvent[] }>();
+
+    for (const e of events) {
+      const attractionId = e._embedded?.attractions?.[0]?.id;
+      const venueId = e._embedded?.venues?.[0]?.id;
+      const key = `${attractionId ?? e.name}::${venueId ?? e._embedded?.venues?.[0]?.name ?? ''}`;
+      const existing = groups.get(key);
+      if (existing) {
+        existing.dates.push(e);
+      } else {
+        groups.set(key, { base: e, dates: [e] });
+      }
+    }
+
+    return [...groups.values()].map(({ base, dates }) => {
+      // Sort the show's performances ascending by start time.
+      const sorted = [...dates].sort((a, b) => {
+        const ta = a.dates?.start?.dateTime ?? '';
+        const tb = b.dates?.start?.dateTime ?? '';
+        return ta < tb ? -1 : ta > tb ? 1 : 0;
+      });
+      // Normalize using the earliest date as the representative, then attach all dates.
+      const representative = sorted[0] ?? base;
+      const normalized = this.normalize(representative);
+      normalized.dates = sorted.map((e) => ({
+        externalId: e.id,
+        startsAt: e.dates?.start?.dateTime ?? null,
+        availability: 'AVAILABLE' as const,
+      }));
+      return normalized;
+    });
   }
 
   async getEvent(externalId: string): Promise<NormalizedEvent | null> {
@@ -63,10 +103,53 @@ export class TicketmasterAdapter implements EventProviderPort {
     )}.json?apikey=${this.config.ticketmaster.apiKey}`;
     try {
       const json = await this.breaker.run(PROVIDER, () => this.getJson(url));
-      return this.normalize(json as TmEvent);
+      const event = json as TmEvent;
+      const normalized = this.normalize(event);
+
+      // Enrich with the show's other performances so the detail page can offer a
+      // date picker even when navigated to directly (one event id -> all nights).
+      const attractionId = event._embedded?.attractions?.[0]?.id;
+      const venueId = event._embedded?.venues?.[0]?.id;
+      if (attractionId) {
+        const siblings = await this.fetchShowDates(attractionId, venueId);
+        if (siblings.length > 1) {
+          const sorted = siblings.sort((a, b) => {
+            const ta = a.dates?.start?.dateTime ?? '';
+            const tb = b.dates?.start?.dateTime ?? '';
+            return ta < tb ? -1 : ta > tb ? 1 : 0;
+          });
+          normalized.dates = sorted.map((e) => ({
+            externalId: e.id,
+            startsAt: e.dates?.start?.dateTime ?? null,
+            availability: 'AVAILABLE' as const,
+          }));
+        }
+      }
+      return normalized;
     } catch (err) {
       if (err instanceof ProviderUnavailableError) throw err;
       return null;
+    }
+  }
+
+  /** Fetch all performances for an attraction (optionally at one venue). Best-effort. */
+  private async fetchShowDates(
+    attractionId: string,
+    venueId?: string,
+  ): Promise<TmEvent[]> {
+    try {
+      const url = new URL(`${this.config.ticketmaster.baseUrl}/events.json`);
+      url.searchParams.set('apikey', this.config.ticketmaster.apiKey);
+      url.searchParams.set('attractionId', attractionId);
+      if (venueId) url.searchParams.set('venueId', venueId);
+      url.searchParams.set('size', '50');
+      url.searchParams.set('sort', 'date,asc');
+      const json = await this.breaker.run(PROVIDER, () =>
+        this.getJson(url.toString()),
+      );
+      return (json?._embedded?.events ?? []) as TmEvent[];
+    } catch {
+      return [];
     }
   }
 
@@ -194,21 +277,40 @@ export class TicketmasterAdapter implements EventProviderPort {
         : null,
       imageUrl: e.images?.[0]?.url ?? null,
       availability: 'AVAILABLE',
+      // Single-date by default; groupByShow() overwrites this for residencies.
+      dates: [
+        {
+          externalId: e.id,
+          startsAt: e.dates?.start?.dateTime ?? null,
+          availability: 'AVAILABLE',
+        },
+      ],
     };
   }
 
   private syntheticEvent(externalId: string): NormalizedEvent {
+    // `TEST-D<n>` encodes an event <n> days from now so refund-policy tiers can be exercised
+    // end-to-end (e.g. TEST-D12 → 100%, TEST-D7 → 50%, TEST-D2 → 0%). Default 30 days out.
+    const m = externalId.match(/-D(\d+)/);
+    const daysOut = m ? Number(m[1]) : 30;
     return {
       provider: 'TICKETMASTER',
       externalId,
       title: `Test Event ${externalId}`,
       category: 'CONCERT',
       venue: { name: 'Test Arena', city: 'Inglewood', lat: 33.95, lng: -118.33 },
-      startsAt: new Date(Date.now() + 30 * 86_400_000).toISOString(),
+      startsAt: new Date(Date.now() + daysOut * 86_400_000).toISOString(),
       endsAt: null,
       priceFrom: { amount: 8500, currency: 'USD' },
       imageUrl: null,
       availability: externalId.startsWith('FAIL') ? 'SOLD_OUT' : 'AVAILABLE',
+      dates: [
+        {
+          externalId,
+          startsAt: new Date(Date.now() + daysOut * 86_400_000).toISOString(),
+          availability: externalId.startsWith('FAIL') ? 'SOLD_OUT' : 'AVAILABLE',
+        },
+      ],
     };
   }
 }
@@ -223,9 +325,11 @@ interface TmEvent {
   images?: Array<{ url: string }>;
   _embedded?: {
     venues?: Array<{
+      id?: string;
       name?: string;
       city?: { name?: string };
       location?: { latitude?: string; longitude?: string };
     }>;
+    attractions?: Array<{ id?: string; name?: string }>;
   };
 }

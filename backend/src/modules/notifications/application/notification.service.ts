@@ -70,7 +70,7 @@ export class NotificationService implements OnModuleInit {
     await this.queue.add(
       'deliver',
       { notificationId: created.id },
-      { jobId: `notif:${created.id}`, attempts: 5, backoff: { type: 'exponential', delay: 3000 } },
+      { jobId: `notif-${created.id}`, attempts: 5, backoff: { type: 'exponential', delay: 3000 } },
     );
   }
 

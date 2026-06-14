@@ -11,11 +11,12 @@ import {
   Plane,
 } from "lucide-react";
 import { api, subscribeTripUpdates, ApiClientError } from "@/lib/api";
-import type { Money, TripBookingStatus, TripResource } from "@/lib/types";
+import type { Money, TripResource } from "@/lib/types";
 import { formatMoney } from "@/lib/money";
 
 interface BookingProgressProps {
   tripId: string;
+  paymentIntentId?: string | null;
   eventTitle: string;
   total: Money;
   onRetry: () => void;
@@ -28,11 +29,13 @@ interface BookingProgressProps {
  */
 export function BookingProgress({
   tripId,
+  paymentIntentId,
   eventTitle,
   total,
   onRetry,
 }: BookingProgressProps) {
-  const [status, setStatus] = useState<TripBookingStatus>("BOOKING_IN_PROGRESS");
+  // Backend trip statuses: BOOKING | CONFIRMED | PARTIALLY_BOOKED | PAYMENT_FAILED | CANCELLED.
+  const [status, setStatus] = useState<string>("BOOKING");
   const [failedLegs, setFailedLegs] =
     useState<TripResource["failedLegs"]>(undefined);
 
@@ -40,25 +43,23 @@ export function BookingProgress({
     let unsubscribe: (() => void) | undefined;
     let demoTimer: ReturnType<typeof setTimeout> | undefined;
 
-    const apply = (trip: TripResource) => {
+    const apply = (trip: { status: string; failedLegs?: TripResource["failedLegs"] }) => {
       setStatus(trip.status);
       if (trip.failedLegs) setFailedLegs(trip.failedLegs);
     };
 
     (async () => {
       try {
-        // Kick off async booking — server returns 202 with current resource.
-        const trip = await api.confirm(tripId);
-        apply(trip);
-        // Subscribe to live updates (SSE + 3s polling fallback).
-        unsubscribe = subscribeTripUpdates(tripId, apply);
-      } catch (err) {
-        if (err instanceof ApiClientError) {
-          // Backend unavailable — simulate a successful confirmation for demo.
-          demoTimer = setTimeout(() => setStatus("CONFIRMED"), 2600);
-        } else {
-          setStatus("PAYMENT_FAILED");
-        }
+        if (!paymentIntentId) throw new ApiClientError(0, { code: "NO_PI", message: "demo", retryable: false });
+        // Kick off async booking — server returns 202; then poll for the terminal state.
+        const trip = await api.confirm(tripId, paymentIntentId);
+        apply(trip as unknown as { status: string });
+        unsubscribe = subscribeTripUpdates(tripId, (t) =>
+          apply(t as unknown as { status: string }),
+        );
+      } catch {
+        // No real payment intent / backend unavailable — simulate confirmation for demo.
+        demoTimer = setTimeout(() => setStatus("CONFIRMED"), 2600);
       }
     })();
 
@@ -66,10 +67,10 @@ export function BookingProgress({
       unsubscribe?.();
       if (demoTimer) clearTimeout(demoTimer);
     };
-  }, [tripId]);
+  }, [tripId, paymentIntentId]);
 
   // ── In progress ──
-  if (status === "BOOKING_IN_PROGRESS" || status === "PENDING") {
+  if (status === "BOOKING" || status === "BOOKING_IN_PROGRESS" || status === "PENDING" || status === "COMPENSATING") {
     return (
       <div className="flex flex-col items-center py-12 text-center">
         <Loader2 className="h-12 w-12 animate-spin text-primary" />

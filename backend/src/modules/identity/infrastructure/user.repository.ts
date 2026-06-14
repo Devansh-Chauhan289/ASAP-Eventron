@@ -39,6 +39,7 @@ export class UserRepository {
   }
 
   createSession(input: {
+    id: string; // must match the sessionId encoded in the refresh JWT (sid claim)
     userId: string;
     refreshHash: string;
     expiresAt: Date;

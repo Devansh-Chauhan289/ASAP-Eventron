@@ -4,31 +4,35 @@ import { Suspense, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { motion } from "framer-motion";
-import { Mail, Lock, AlertCircle } from "lucide-react";
-import { auth } from "@/lib/api";
-import { ApiClientError } from "@/lib/api";
+import { Mail, Lock, User, AlertCircle } from "lucide-react";
+import { auth, ApiClientError } from "@/lib/api";
 
-function LoginForm() {
+function RegisterForm() {
   const router = useRouter();
   const params = useSearchParams();
   const next = params.get("next") || "/home";
+  const [displayName, setDisplayName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const handleSignIn = async (e: React.FormEvent) => {
+  const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    if (password.length < 8) {
+      setError("Password must be at least 8 characters.");
+      return;
+    }
     setLoading(true);
     try {
-      await auth.login({ email, password });
+      await auth.register({ email, password, displayName });
       router.push(next);
     } catch (err) {
       setError(
         err instanceof ApiClientError
           ? err.message
-          : "Sign in failed. Please try again.",
+          : "Could not create your account. Please try again.",
       );
       setLoading(false);
     }
@@ -36,7 +40,7 @@ function LoginForm() {
 
   return (
     <form
-      onSubmit={handleSignIn}
+      onSubmit={handleRegister}
       className="w-full max-w-sm rounded-lg bg-white p-8 card-shadow"
     >
       <Link href="/" className="mb-6 flex items-center justify-center gap-1">
@@ -45,10 +49,10 @@ function LoginForm() {
       </Link>
 
       <h1 className="text-center text-xl font-bold text-ink-primary">
-        Welcome back
+        Create your account
       </h1>
       <p className="mt-1 text-center text-sm text-ink-secondary">
-        Sign in to plan events and book travel.
+        Plan events, book travel, manage the whole trip in one place.
       </p>
 
       {error && (
@@ -59,6 +63,17 @@ function LoginForm() {
       )}
 
       <div className="mt-6 space-y-3">
+        <div className="flex items-center gap-2 rounded-md border border-gray-200 px-3 py-2.5">
+          <User className="h-4 w-4 text-ink-secondary" />
+          <input
+            type="text"
+            required
+            value={displayName}
+            onChange={(e) => setDisplayName(e.target.value)}
+            className="w-full text-sm outline-none"
+            placeholder="Full name"
+          />
+        </div>
         <div className="flex items-center gap-2 rounded-md border border-gray-200 px-3 py-2.5">
           <Mail className="h-4 w-4 text-ink-secondary" />
           <input
@@ -75,10 +90,11 @@ function LoginForm() {
           <input
             type="password"
             required
+            minLength={8}
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             className="w-full text-sm outline-none"
-            placeholder="Password"
+            placeholder="Password (min 8 characters)"
           />
         </div>
       </div>
@@ -88,23 +104,23 @@ function LoginForm() {
         disabled={loading}
         className="mt-6 w-full rounded-md bg-primary py-3 font-semibold text-white transition-colors hover:bg-primary-600 disabled:opacity-60"
       >
-        {loading ? "Signing in…" : "Sign In"}
+        {loading ? "Creating account…" : "Create Account"}
       </button>
 
       <p className="mt-4 text-center text-sm text-ink-secondary">
-        New to ASAP?{" "}
+        Already have an account?{" "}
         <Link
-          href={`/register?next=${encodeURIComponent(next)}`}
+          href={`/login?next=${encodeURIComponent(next)}`}
           className="font-semibold text-primary hover:underline"
         >
-          Create an account
+          Sign in
         </Link>
       </p>
     </form>
   );
 }
 
-export default function LoginPage() {
+export default function RegisterPage() {
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-bg-dark p-4">
       <div className="pointer-events-none absolute inset-0">
@@ -117,7 +133,7 @@ export default function LoginPage() {
         className="relative z-10 w-full max-w-sm"
       >
         <Suspense fallback={null}>
-          <LoginForm />
+          <RegisterForm />
         </Suspense>
       </motion.div>
     </div>

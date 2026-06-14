@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { PaymentStatus, Prisma } from '@prisma/client';
+import { PaymentStatus, Prisma, RefundStatus } from '@prisma/client';
 import { PrismaService } from '@shared/prisma/prisma.service';
 import { Tx } from '@shared/prisma/prisma.tx';
 import { OptimisticLockError } from '@shared/common/errors/domain-error';
@@ -78,5 +78,25 @@ export class PaymentRepository {
     return tx.charge.create({
       data: { ...data, capturedAt: new Date() },
     });
+  }
+
+  findRefundByIdempotencyKey(key: string) {
+    return this.prisma.refund.findUnique({ where: { idempotencyKey: key } });
+  }
+
+  createRefund(
+    tx: Tx,
+    data: {
+      paymentIntentId: string;
+      tripLegId?: string;
+      amount: bigint;
+      currency: string;
+      reason: string;
+      stripeRefundId: string;
+      idempotencyKey: string;
+      status: RefundStatus;
+    },
+  ) {
+    return tx.refund.create({ data });
   }
 }

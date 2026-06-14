@@ -35,4 +35,8 @@ export class EventBookingFacade implements EventBookingPort {
   release(input: { bookingId: string; idempotencyKey: string }): Promise<void> {
     return this.service.release(input);
   }
+
+  cancel(input: { bookingId: string; idempotencyKey: string }): Promise<void> {
+    return this.service.cancel(input);
+  }
 }

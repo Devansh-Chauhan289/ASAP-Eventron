@@ -37,6 +37,10 @@ export class AppConfig {
   get databaseUrl() {
     return this.req('DATABASE_URL');
   }
+  /** Direct (non-pooled) URL for migrations; falls back to the pooled URL. */
+  get directUrl() {
+    return this.cfg.get<string>('DIRECT_URL') ?? this.req('DATABASE_URL');
+  }
   get redis() {
     return {
       host: this.req('REDIS_HOST'),
@@ -53,9 +57,18 @@ export class AppConfig {
     };
   }
   get stripe() {
+    const secretKey = this.req('STRIPE_SECRET_KEY');
+    const mode = this.req('PAYMENTS_MODE');
+    const looksPlaceholder =
+      !secretKey ||
+      secretKey.includes('placeholder') ||
+      secretKey === 'sk_test_xxx' ||
+      !secretKey.startsWith('sk_');
     return {
-      secretKey: this.req('STRIPE_SECRET_KEY'),
+      secretKey,
       webhookSecret: this.req('STRIPE_WEBHOOK_SECRET'),
+      // resolved boolean the StripeAdapter uses to pick real vs fake
+      mock: mode === 'mock' || (mode === 'auto' && looksPlaceholder),
     };
   }
   get ticketmaster() {

@@ -51,7 +51,22 @@ export interface PaymentsPort {
     paymentIntentId: string;
     idempotencyKey: string;
   }): Promise<void>;
+  /** Refunds a (partial or full) captured amount; posts the reversing ledger entries. */
+  refund(input: {
+    paymentIntentId: string;
+    amount: Money;
+    reason: string;
+    idempotencyKey: string;
+    tripLegId?: string;
+  }): Promise<RefundResult>;
   getSummary(paymentIntentId: string): Promise<PaymentSummary | null>;
+}
+
+export interface RefundResult {
+  ok: boolean;
+  refundId: string;
+  status: string;
+  refundedAmount: number;
 }
 
 export interface PaymentSummary {

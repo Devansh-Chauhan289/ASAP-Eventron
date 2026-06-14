@@ -1,16 +1,19 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { Search, SlidersHorizontal, ChevronDown } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Search, SlidersHorizontal, ChevronDown, Loader2 } from "lucide-react";
 import { AppShell } from "@/components/AppShell";
 import { EventCard } from "@/components/EventCard";
 import { FilterChips } from "@/components/FilterChips";
 import { Reveal } from "@/components/Reveal";
-import { events } from "@/lib/data";
+import { events as mockEvents } from "@/lib/data";
+import { api } from "@/lib/api";
+import { mapApiEvent, type ApiEvent } from "@/lib/map";
+import type { EventItem } from "@/lib/types";
 
-const CATEGORIES = ["All", "Concerts", "Tech", "Sports", "Workshops", "Arts"];
+const CATEGORIES = ["All", "Concerts", "Sports", "Arts", "Festivals"];
 const SORTS = ["Newest First", "Price: Low to High", "Price: High to Low", "Top Rated"];
-const PAGE_SIZE = 4;
+const PAGE_SIZE = 6;
 
 export default function EventsPage() {
   const [selected, setSelected] = useState<string[]>(["All"]);
@@ -18,17 +21,42 @@ export default function EventsPage() {
   const [sort, setSort] = useState(SORTS[0]);
   const [visible, setVisible] = useState(PAGE_SIZE);
 
-  const filtered = useMemo(() => {
-    let list = events.filter((e) => {
-      const catOk =
-        selected.includes("All") || selected.includes(e.category);
-      const queryOk =
-        e.title.toLowerCase().includes(query.toLowerCase()) ||
-        e.city.toLowerCase().includes(query.toLowerCase());
-      return catOk && queryOk;
-    });
+  const [results, setResults] = useState<EventItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [usingFallback, setUsingFallback] = useState(false);
+  const reqId = useRef(0);
 
-    const priceOf = (p: typeof events[number]["price"]) => p?.amount ?? 0;
+  // Fetch real Ticketmaster events from the backend (debounced on the search query).
+  useEffect(() => {
+    const id = ++reqId.current;
+    setLoading(true);
+    const t = setTimeout(async () => {
+      try {
+        const res = await api.searchEvents({
+          q: query.trim() || undefined,
+          limit: 24,
+        });
+        if (id !== reqId.current) return; // a newer query superseded this one
+        const mapped = (res.data as ApiEvent[]).map(mapApiEvent);
+        setResults(mapped);
+        setUsingFallback(false);
+      } catch {
+        if (id !== reqId.current) return;
+        // Backend/Ticketmaster unreachable — fall back to local sample data.
+        setResults(mockEvents);
+        setUsingFallback(true);
+      } finally {
+        if (id === reqId.current) setLoading(false);
+      }
+    }, 350);
+    return () => clearTimeout(t);
+  }, [query]);
+
+  const filtered = useMemo(() => {
+    let list = results.filter(
+      (e) => selected.includes("All") || selected.includes(e.category),
+    );
+    const priceOf = (p: EventItem["price"]) => p?.amount ?? 0;
     switch (sort) {
       case "Price: Low to High":
         list = [...list].sort((a, b) => priceOf(a.price) - priceOf(b.price));
@@ -43,7 +71,7 @@ export default function EventsPage() {
         list = [...list].sort((a, b) => b.isoDate.localeCompare(a.isoDate));
     }
     return list;
-  }, [selected, query, sort]);
+  }, [results, selected, sort]);
 
   const shown = filtered.slice(0, visible);
   const hasMore = visible < filtered.length;
@@ -57,7 +85,6 @@ export default function EventsPage() {
           </h1>
         </Reveal>
 
-        {/* Search */}
         <Reveal delay={0.05} className="mt-4">
           <div className="flex items-center gap-3 rounded-md bg-white px-4 py-3 card-shadow">
             <Search className="h-5 w-5 text-ink-secondary" />
@@ -67,14 +94,14 @@ export default function EventsPage() {
                 setQuery(e.target.value);
                 setVisible(PAGE_SIZE);
               }}
-              placeholder="Search events, cities, artists..."
+              placeholder="Search live events (powered by Ticketmaster)…"
               className="w-full bg-transparent text-sm outline-none placeholder:text-ink-secondary"
             />
+            {loading && <Loader2 className="h-4 w-4 animate-spin text-primary" />}
           </div>
         </Reveal>
 
         <div className="mt-6 flex gap-8">
-          {/* Desktop sidebar filters */}
           <aside className="hidden w-56 shrink-0 lg:block">
             <div className="sticky top-24 rounded-lg bg-white p-5 card-shadow">
               <div className="mb-4 flex items-center gap-2 font-semibold text-ink-primary">
@@ -115,7 +142,6 @@ export default function EventsPage() {
           </aside>
 
           <div className="min-w-0 flex-1">
-            {/* Mobile chips */}
             <div className="lg:hidden">
               <FilterChips
                 options={CATEGORIES}
@@ -128,13 +154,17 @@ export default function EventsPage() {
               />
             </div>
 
-            {/* Results count + sort */}
             <div className="mt-4 flex items-center justify-between">
               <p className="text-sm text-ink-secondary">
                 <span className="font-semibold text-ink-primary">
                   {filtered.length}
                 </span>{" "}
                 events found
+                {usingFallback && (
+                  <span className="ml-2 rounded-full bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-700">
+                    sample data (backend unreachable)
+                  </span>
+                )}
               </p>
               <div className="relative">
                 <select
@@ -150,7 +180,6 @@ export default function EventsPage() {
               </div>
             </div>
 
-            {/* List */}
             <div className="mt-4 grid gap-4 md:grid-cols-2">
               {shown.map((e, i) => (
                 <Reveal key={e.id} delay={(i % PAGE_SIZE) * 0.05}>
@@ -159,9 +188,15 @@ export default function EventsPage() {
               ))}
             </div>
 
-            {shown.length === 0 && (
+            {loading && shown.length === 0 && (
+              <div className="mt-12 flex justify-center text-ink-secondary">
+                <Loader2 className="h-6 w-6 animate-spin text-primary" />
+              </div>
+            )}
+
+            {!loading && shown.length === 0 && (
               <div className="mt-12 text-center text-ink-secondary">
-                No events match your filters.
+                No events match your search.
               </div>
             )}
 

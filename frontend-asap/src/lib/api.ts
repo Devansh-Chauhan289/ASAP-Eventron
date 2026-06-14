@@ -1,20 +1,25 @@
 import { v4 as uuidv4 } from "uuid";
-import type {
-  ApiError,
-  Paginated,
-  TripResource,
-} from "./types";
+import type { ApiError, Paginated, TripResource } from "./types";
+import {
+  AuthUser,
+  Tokens,
+  clearTokens,
+  getAccessToken,
+  getRefreshToken,
+  setTokens,
+  storeUser,
+} from "./auth";
 
 const BASE_URL =
-  process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3000/api/v1";
+  process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:1201/api/v1";
 
-// POST routes that require an Idempotency-Key.
+// POST routes that require an Idempotency-Key (mirrors the backend @Idempotent() routes).
 const IDEMPOTENT_PATTERNS = [
   /^\/trips\/[^/]+\/checkout$/,
   /^\/trips\/[^/]+\/confirm$/,
   /^\/trips\/[^/]+\/cancel$/,
-  /^\/trips(\/.*)?$/,
-  /^\/legs(\/.*)?$/,
+  /^\/trips\/[^/]+\/legs/,
+  /^\/trips$/,
 ];
 
 function needsIdempotencyKey(method: string, path: string): boolean {
@@ -40,21 +45,18 @@ export class ApiClientError extends Error {
 interface RequestOptions {
   method?: string;
   body?: unknown;
-  // Stable idempotency key — reused verbatim across retries of the SAME logical op.
   idempotencyKey?: string;
   signal?: AbortSignal;
   query?: Record<string, string | number | undefined>;
-  // Max automatic retries for retryable failures / 429s.
   maxRetries?: number;
+  // internal: set true after we've already tried a token refresh, to avoid loops
+  _authRetried?: boolean;
+  // skip attaching the Authorization header (auth endpoints)
+  _noAuth?: boolean;
 }
 
-const sleep = (ms: number) =>
-  new Promise((resolve) => setTimeout(resolve, ms));
-
-// Random jitter so retries don't thundering-herd.
-function jitter(base: number): number {
-  return base + Math.floor(Math.random() * 400);
-}
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const jitter = (base: number) => base + Math.floor(Math.random() * 400);
 
 function buildUrl(path: string, query?: RequestOptions["query"]): string {
   const url = new URL(BASE_URL + path);
@@ -66,14 +68,34 @@ function buildUrl(path: string, query?: RequestOptions["query"]): string {
   return url.toString();
 }
 
+/** Exchange the refresh token for a fresh token pair. Returns true on success. */
+async function refreshTokens(): Promise<boolean> {
+  const refreshToken = getRefreshToken();
+  if (!refreshToken) return false;
+  try {
+    const res = await fetch(buildUrl("/auth/refresh"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ refreshToken }),
+    });
+    if (!res.ok) return false;
+    const data = (await res.json().catch(() => null)) as
+      | { tokens?: Tokens }
+      | null;
+    if (!data?.tokens?.accessToken) return false;
+    setTokens(data.tokens);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Core fetch wrapper.
- * - Auth: the JWT lives in an httpOnly cookie attached by the browser via
- *   `credentials: "include"`; the Next.js middleware also forwards/refreshes it.
- * - Idempotency: a uuid v4 key is generated once per logical POST and REUSED
- *   on every retry so the server dedupes correctly.
- * - Retry: on 429 honor Retry-After (+jitter); on { retryable: true } envelope
- *   retry with the SAME key; on { retryable: false } surface immediately.
+ * - Auth: attaches `Authorization: Bearer <accessToken>` from local storage.
+ * - On 401: transparently refreshes the token ONCE and retries.
+ * - Idempotency: a uuid v4 key generated once per logical POST, REUSED on retry.
+ * - Retry: 429 honors Retry-After (+jitter); `{ retryable:true }` retries with same key.
  */
 export async function apiFetch<T>(
   path: string,
@@ -82,31 +104,29 @@ export async function apiFetch<T>(
   const method = (opts.method ?? "GET").toUpperCase();
   const maxRetries = opts.maxRetries ?? 3;
 
-  // Generate the idempotency key ONCE — stays constant across retries.
   const idempotencyKey =
     opts.idempotencyKey ??
     (needsIdempotencyKey(method, path) ? uuidv4() : undefined);
 
   let attempt = 0;
-  // eslint-disable-next-line no-constant-condition
   while (true) {
-    const headers: Record<string, string> = {
-      Accept: "application/json",
-    };
+    const headers: Record<string, string> = { Accept: "application/json" };
     if (opts.body !== undefined) headers["Content-Type"] = "application/json";
     if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
+    if (!opts._noAuth) {
+      const token = getAccessToken();
+      if (token) headers["Authorization"] = `Bearer ${token}`;
+    }
 
     let res: Response;
     try {
       res = await fetch(buildUrl(path, opts.query), {
         method,
         headers,
-        credentials: "include",
         body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
         signal: opts.signal,
       });
     } catch (networkErr) {
-      // Network-level failures are retryable.
       if (attempt < maxRetries) {
         attempt += 1;
         await sleep(jitter(500 * attempt));
@@ -122,7 +142,15 @@ export async function apiFetch<T>(
       });
     }
 
-    // 429 — honor Retry-After header with jitter, reuse same key.
+    // 401 — try a single transparent token refresh, then replay once.
+    if (res.status === 401 && !opts._authRetried && !opts._noAuth) {
+      const ok = await refreshTokens();
+      if (ok) {
+        return apiFetch<T>(path, { ...opts, _authRetried: true, idempotencyKey });
+      }
+      clearTokens();
+    }
+
     if (res.status === 429 && attempt < maxRetries) {
       const retryAfter = Number(res.headers.get("Retry-After") ?? "1");
       attempt += 1;
@@ -130,9 +158,7 @@ export async function apiFetch<T>(
       continue;
     }
 
-    if (res.status === 204) {
-      return undefined as T;
-    }
+    if (res.status === 204) return undefined as T;
 
     const payload = await res.json().catch(() => null);
 
@@ -143,14 +169,11 @@ export async function apiFetch<T>(
         message: env?.message ?? `Request failed (${res.status})`,
         retryable: env?.retryable ?? false,
       };
-
-      // retryable:true => retry with SAME idempotency key.
       if (apiError.retryable && attempt < maxRetries) {
         attempt += 1;
         await sleep(jitter(500 * attempt));
         continue;
       }
-      // retryable:false => surface to user immediately.
       throw new ApiClientError(res.status, apiError);
     }
 
@@ -158,32 +181,130 @@ export async function apiFetch<T>(
   }
 }
 
-// ── Typed endpoint helpers ────────────────────────────────────
+// ── Auth ──────────────────────────────────────────────────────
+interface AuthResponse {
+  user: AuthUser;
+  tokens: Tokens;
+}
 
-export const api = {
-  /** Cursor-paginated list. Pass pageInfo.nextCursor as `cursor` for next page. */
-  listEvents(cursor?: string) {
-    return apiFetch<Paginated<unknown>>("/events", {
-      query: { cursor, limit: 12 },
+export const auth = {
+  async register(input: {
+    email: string;
+    password: string;
+    displayName: string;
+  }): Promise<AuthResponse> {
+    const res = await apiFetch<AuthResponse>("/auth/register", {
+      method: "POST",
+      body: input,
+      _noAuth: true,
     });
+    setTokens(res.tokens);
+    storeUser(res.user);
+    return res;
+  },
+
+  async login(input: {
+    email: string;
+    password: string;
+  }): Promise<AuthResponse> {
+    const res = await apiFetch<AuthResponse>("/auth/login", {
+      method: "POST",
+      body: input,
+      _noAuth: true,
+    });
+    setTokens(res.tokens);
+    storeUser(res.user);
+    return res;
+  },
+
+  async logout(): Promise<void> {
+    const refreshToken = getRefreshToken();
+    try {
+      if (refreshToken) {
+        await apiFetch<void>("/auth/logout", {
+          method: "POST",
+          body: { refreshToken },
+          _noAuth: true,
+        });
+      }
+    } finally {
+      clearTokens();
+    }
+  },
+
+  me() {
+    return apiFetch<AuthUser>("/me");
+  },
+};
+
+// ── Typed endpoint helpers ────────────────────────────────────
+export const api = {
+  /** Real event search backed by the provider ACL (Ticketmaster). */
+  searchEvents(params: {
+    q?: string;
+    city?: string;
+    from?: string;
+    to?: string;
+    limit?: number;
+    cursor?: string;
+  }) {
+    return apiFetch<Paginated<unknown>>("/events/search", { query: params });
+  },
+
+  getEvent(externalId: string) {
+    return apiFetch<unknown>(`/events/${encodeURIComponent(externalId)}`);
+  },
+
+  recommendTrip(eventId: string) {
+    return apiFetch<unknown>("/recommendations/trip", { query: { eventId } });
+  },
+
+  listTrips(cursor?: string) {
+    return apiFetch<Paginated<TripResource>>("/trips", {
+      query: { cursor, limit: 20 },
+    });
+  },
+
+  createTrip(input: {
+    anchor: { eventId: string; ticketTier: string; quantity: number };
+  }) {
+    return apiFetch<TripResource>("/trips", { method: "POST", body: input });
   },
 
   getTrip(tripId: string, signal?: AbortSignal) {
     return apiFetch<TripResource>(`/trips/${tripId}`, { signal });
   },
 
-  /** Creates the Stripe PaymentIntent; returns { clientSecret }. */
-  checkout(tripId: string, idempotencyKey?: string) {
-    return apiFetch<{ clientSecret: string }>(`/trips/${tripId}/checkout`, {
-      method: "POST",
-      idempotencyKey,
-    });
+  quote(tripId: string) {
+    return apiFetch<{ total: { amount: number; currency: string } }>(
+      `/trips/${tripId}/quote`,
+      { method: "POST" },
+    );
   },
 
-  /** Kicks off async booking — server responds 202; poll/stream for terminal state. */
-  confirm(tripId: string, idempotencyKey?: string) {
+  /**
+   * Creates the Stripe PaymentIntent. Backend returns `stripeClientSecret`; we also expose
+   * `clientSecret` as an alias for existing consumers.
+   */
+  async checkout(tripId: string, idempotencyKey?: string) {
+    const res = await apiFetch<{
+      paymentIntentId: string;
+      stripeClientSecret: string;
+      amount: { amount: number; currency: string };
+      status: string;
+    }>(`/trips/${tripId}/checkout`, { method: "POST", body: {}, idempotencyKey });
+    return { ...res, clientSecret: res.stripeClientSecret };
+  },
+
+  /**
+   * Kicks off async booking — server responds 202; poll for terminal state.
+   * `paymentIntentId` is required by the backend; when omitted (legacy demo callers) the
+   * request fails fast and the UI falls back to its demo path.
+   */
+  confirm(tripId: string, paymentIntentId?: string, idempotencyKey?: string) {
     return apiFetch<TripResource>(`/trips/${tripId}/confirm`, {
       method: "POST",
+      body: paymentIntentId ? { paymentIntentId } : {},
       idempotencyKey,
     });
   },
@@ -191,6 +312,7 @@ export const api = {
   cancel(tripId: string, idempotencyKey?: string) {
     return apiFetch<TripResource>(`/trips/${tripId}/cancel`, {
       method: "POST",
+      body: {},
       idempotencyKey,
     });
   },
@@ -206,10 +328,9 @@ export function subscribeTripUpdates(
   onError?: (err: unknown) => void,
 ): () => void {
   let closed = false;
-  let es: EventSource | null = null;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
 
-  const TERMINAL: TripResource["status"][] = [
+  const TERMINAL = [
     "CONFIRMED",
     "PARTIALLY_BOOKED",
     "PAYMENT_FAILED",
@@ -218,33 +339,11 @@ export function subscribeTripUpdates(
 
   const stop = () => {
     closed = true;
-    es?.close();
     if (pollTimer) clearInterval(pollTimer);
   };
 
-  // Primary: EventSource live stream.
-  try {
-    es = new EventSource(`${BASE_URL}/trips/${tripId}/events`, {
-      withCredentials: true,
-    });
-    es.onmessage = (evt) => {
-      try {
-        const trip = JSON.parse(evt.data) as TripResource;
-        onUpdate(trip);
-        if (TERMINAL.includes(trip.status)) stop();
-      } catch (e) {
-        onError?.(e);
-      }
-    };
-    es.onerror = (e) => {
-      // Stream dropped — the polling fallback below keeps us alive.
-      onError?.(e);
-    };
-  } catch (e) {
-    onError?.(e);
-  }
-
-  // Fallback: poll every 3s regardless, in case SSE is unavailable.
+  // Poll every 2.5s (EventSource can't send the Authorization header, so polling is the
+  // reliable path for a Bearer-auth API; the backend SSE remains available for cookie auth).
   pollTimer = setInterval(async () => {
     if (closed) return;
     try {
@@ -254,7 +353,7 @@ export function subscribeTripUpdates(
     } catch (e) {
       onError?.(e);
     }
-  }, 3000);
+  }, 2500);
 
   return stop;
 }

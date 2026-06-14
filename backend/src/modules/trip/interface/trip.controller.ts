@@ -128,9 +128,18 @@ export class TripController {
     };
   }
 
+  /** Preview the refund a cancellation would yield right now (read-only, for the UI timeline). */
+  @Get(':id/cancellation-quote')
+  async cancellationQuote(
+    @CurrentUser() user: AuthUser,
+    @Param('id', ParseUUIDPipe) id: string,
+  ) {
+    return this.trips.quoteCancellation(id, user.userId);
+  }
+
   @Post(':id/cancel')
   @Idempotent()
-  @HttpCode(202)
+  @HttpCode(200)
   async cancel(
     @CurrentUser() user: AuthUser,
     @Param('id', ParseUUIDPipe) id: string,

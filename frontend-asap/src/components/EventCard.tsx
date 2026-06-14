@@ -17,7 +17,11 @@ interface EventCardProps {
 
 function PriceBadge({ event }: { event: EventItem }) {
   if (event.soldOut) return <SmartTag kind="soldout" />;
-  if (!event.price) return <SmartTag kind="free" />;
+  // Ticketmaster search often omits price; show a neutral CTA rather than "Free".
+  if (!event.price)
+    return (
+      <span className="text-sm font-semibold text-primary">See tickets</span>
+    );
   return (
     <span className="text-base font-bold text-ink-primary">
       {formatMoney(event.price)}
@@ -31,6 +35,10 @@ export function EventCard({
   className,
 }: EventCardProps) {
   const href = `/events/${event.slug}`;
+  // Residencies / multi-night shows carry more than one performance date.
+  const dateCount = event.dates?.length ?? 1;
+  const multiDate = dateCount > 1;
+  const dateLabel = multiDate ? `${dateCount} dates` : event.date;
 
   // ── Featured / grid (large, dark overlay) ──
   if (variant === "featured") {
@@ -63,7 +71,12 @@ export function EventCard({
           <div className="absolute inset-x-0 bottom-0 p-5 text-white">
             <div className="mb-1 flex items-center gap-1 text-xs font-medium text-white/80">
               <Calendar className="h-3.5 w-3.5" />
-              {event.date}
+              {dateLabel}
+              {multiDate && (
+                <span className="ml-1 rounded-full bg-white/20 px-1.5 py-0.5 text-[10px] font-semibold">
+                  Multiple
+                </span>
+              )}
             </div>
             <h3 className="mb-1 text-lg font-bold leading-snug">
               {event.title}
@@ -163,7 +176,7 @@ export function EventCard({
           <div className="mt-1 flex items-center gap-3 text-xs text-ink-secondary">
             <span className="flex items-center gap-1">
               <Calendar className="h-3.5 w-3.5" />
-              {event.date}
+              {dateLabel}
             </span>
             <span className="flex items-center gap-1 truncate">
               <MapPin className="h-3.5 w-3.5" />

@@ -51,12 +51,21 @@ export interface TicketTier {
   transferable: boolean;
 }
 
+/** One bookable performance of a show (a single night of a residency). */
+export interface EventDateOption {
+  externalId: string;
+  startsAt: string | null; // ISO
+  date: string; // human-readable, e.g. "Sep 19, 2026"
+  time?: string;
+  soldOut?: boolean;
+}
+
 export interface EventItem {
   id: string;
   slug: string;
   title: string;
   category: EventCategory;
-  date: string; // human readable
+  date: string; // human readable (the selected / earliest date)
   isoDate: string;
   time?: string;
   venue: string;
@@ -75,6 +84,8 @@ export interface EventItem {
   artists?: Artist[];
   ticketTiers?: TicketTier[];
   reviews?: Review[];
+  // All performances of this show (a residency lists many). Always >= 1 entry.
+  dates?: EventDateOption[];
 }
 
 export interface TransportOption {

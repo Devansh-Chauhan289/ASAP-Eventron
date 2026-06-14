@@ -1,15 +1,16 @@
 "use client";
 
-import { forwardRef, useEffect, useMemo, useState } from "react";
+import { forwardRef, useEffect, useMemo, useRef, useState } from "react";
 import { useForm } from "react-hook-form";
 import { motion, AnimatePresence } from "framer-motion";
 import Link from "next/link";
-import { ChevronLeft } from "lucide-react";
+import { ChevronLeft, Loader2 } from "lucide-react";
 import { AppShell } from "@/components/AppShell";
 import { StepIndicator } from "@/components/StepIndicator";
 import { StripePaymentStep } from "@/components/checkout/StripePaymentStep";
 import { BookingProgress } from "@/components/checkout/BookingProgress";
 import { formatMoney } from "@/lib/money";
+import { api } from "@/lib/api";
 import type { Money } from "@/lib/types";
 
 const STEPS = ["Tickets", "Details", "Payment", "Confirm"];
@@ -60,8 +61,10 @@ export default function CheckoutPage() {
   const [step, setStep] = useState(0);
   const [direction, setDirection] = useState(1);
   const [data, setData] = useState<CheckoutData>(DEMO);
-  // Stable trip id for this checkout session (idempotency anchor).
-  const [tripId] = useState(() => `trip_${Math.random().toString(36).slice(2, 10)}`);
+  // Real backend trip + payment intent created when the user reaches the Payment step.
+  const [tripId, setTripId] = useState<string | null>(null);
+  const [paymentIntentId, setPaymentIntentId] = useState<string | null>(null);
+  const creatingRef = useRef(false);
 
   const {
     register,
@@ -114,6 +117,27 @@ export default function CheckoutPage() {
     () => data.selection.reduce((n, l) => n + l.qty, 0),
     [data.selection],
   );
+
+  // Create the real backend trip once the user reaches the Payment step (idempotent guard).
+  useEffect(() => {
+    if (step !== 2 || tripId || creatingRef.current) return;
+    creatingRef.current = true;
+    (async () => {
+      try {
+        const trip = await api.createTrip({
+          anchor: {
+            eventId: data.eventId,
+            ticketTier: data.selection[0]?.tierId ?? "GA",
+            quantity: totalTickets || 1,
+          },
+        });
+        setTripId(trip.id);
+      } catch {
+        // Backend unavailable — fall back to a demo id so the UI still flows.
+        setTripId(`demo_${Math.random().toString(36).slice(2, 10)}`);
+      }
+    })();
+  }, [step, tripId, data, totalTickets]);
 
   return (
     <AppShell>
@@ -304,21 +328,32 @@ export default function CheckoutPage() {
                 <div>
                   <h2 className="text-xl font-bold text-ink-primary">Payment</h2>
                   <div className="mt-4 rounded-lg bg-white p-5 card-shadow">
-                    <StripePaymentStep
-                      tripId={tripId}
-                      amount={total}
-                      promoSaved={promoApplied ? discount : null}
-                      onPaid={() => go(3)}
-                    />
+                    {!tripId ? (
+                      <div className="flex items-center justify-center gap-2 py-8 text-sm text-ink-secondary">
+                        <Loader2 className="h-5 w-5 animate-spin text-primary" />
+                        Preparing your order…
+                      </div>
+                    ) : (
+                      <StripePaymentStep
+                        tripId={tripId}
+                        amount={total}
+                        promoSaved={promoApplied ? discount : null}
+                        onPaid={(pi) => {
+                          setPaymentIntentId(pi);
+                          go(3);
+                        }}
+                      />
+                    )}
                   </div>
                 </div>
               )}
 
               {/* ── STEP 4: Confirmation ── */}
-              {step === 3 && (
+              {step === 3 && tripId && (
                 <div className="rounded-lg bg-white p-6 card-shadow">
                   <BookingProgress
                     tripId={tripId}
+                    paymentIntentId={paymentIntentId}
                     eventTitle={data.eventTitle}
                     total={total}
                     onRetry={() => go(2)}
